@@ -1,0 +1,40 @@
+#include "/Engine/Public/Platform.ush"
+
+RWTexture2D<float4> RenderTarget;
+Buffer<float> LineDrawDesc;
+Buffer<int> LineData;
+
+float GetLineAlpha(float Distance, float Thickness)
+{
+	float HalfThickness = Thickness * 0.5f;
+	if (abs(Distance) > HalfThickness) return 0.0f;
+	return 1.0f - smoothstep(0.0f, HalfThickness, abs(Distance));
+}
+
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void SimpleComputeShader(
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint GroupIndex : SV_GroupIndex )
+{
+    float Width = LineDrawDesc[0];
+    float Height = LineDrawDesc[1];
+	
+    uint2 PixelCoord = DispatchThreadId.xy;
+	
+	if (PixelCoord.x >= Width || PixelCoord.y >= Height)
+    {
+        return;
+    }
+	int SinValue = LineData[PixelCoord.x];
+	
+    if (PixelCoord.y == SinValue)
+    {
+        // 如果在波形上，则写入颜色
+        RenderTarget[PixelCoord] = float4(0, 1, 1, 1);
+    }
+    else
+    {
+        // 否则写入透明色
+        RenderTarget[PixelCoord] = float4(0, 0, 0.5, 0.5);
+    }
+}
