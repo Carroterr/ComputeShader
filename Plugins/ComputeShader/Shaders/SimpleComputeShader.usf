@@ -2,39 +2,62 @@
 
 RWTexture2D<float4> RenderTarget;
 Buffer<float> LineDrawDesc;
-Buffer<int> LineData;
+Buffer<float> LineData;
 
-float GetLineAlpha(float Distance, float Thickness)
+float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
 {
-	float HalfThickness = Thickness * 0.5f;
-	if (abs(Distance) > HalfThickness) return 0.0f;
-	return 1.0f - smoothstep(0.0f, HalfThickness, abs(Distance));
+	float2 Segment = End - Start;
+	float SegmentLengthSquared = max(dot(Segment, Segment), 0.0001f);
+	float T = saturate(dot(Pixel - Start, Segment) / SegmentLengthSquared);
+	float2 Closest = Start + Segment * T;
+	return length(Pixel - Closest);
 }
 
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void SimpleComputeShader(
 	uint3 DispatchThreadId : SV_DispatchThreadID,
-	uint GroupIndex : SV_GroupIndex )
+	uint GroupIndex : SV_GroupIndex)
 {
-    float Width = LineDrawDesc[0];
-    float Height = LineDrawDesc[1];
-	
-    uint2 PixelCoord = DispatchThreadId.xy;
-	
-	if (PixelCoord.x >= Width || PixelCoord.y >= Height)
-    {
-        return;
-    }
-	int SinValue = LineData[PixelCoord.x];
-	
-    if (PixelCoord.y == SinValue)
-    {
-        // 如果在波形上，则写入颜色
-        RenderTarget[PixelCoord] = float4(0, 1, 1, 1);
-    }
-    else
-    {
-        // 否则写入透明色
-        RenderTarget[PixelCoord] = float4(0, 0, 0.5, 0.5);
-    }
+	float Width = LineDrawDesc[0];
+	float Height = LineDrawDesc[1];
+	float LineWidth = 2.0f;
+	float HalfWidth = LineWidth * 0.5f;
+	float AntiAliasWidth = 1.0f;
+
+	uint2 PixelCoord = DispatchThreadId.xy;
+
+	if (PixelCoord.x >= Width || PixelCoord.y >= Height || Width < 2.0f)
+	{
+		return;
+	}
+
+	int WidthInt = (int)Width;
+	int CenterX = (int)PixelCoord.x;
+	int SearchRadius = (int)ceil(HalfWidth + AntiAliasWidth) + 2;
+
+	float2 Pixel = float2((float)PixelCoord.x + 0.5f, (float)PixelCoord.y + 0.5f);
+	float MinDistance = 100000.0f;
+
+	for (int Offset = -SearchRadius; Offset <= SearchRadius; ++Offset)
+	{
+		int StartSampleIndex = CenterX + Offset;
+		int EndSampleIndex = StartSampleIndex + 1;
+
+		if (StartSampleIndex < 0 || EndSampleIndex >= WidthInt)
+		{
+			continue;
+		}
+
+		float2 SegmentStart = float2((float)StartSampleIndex + 0.5f, LineData[StartSampleIndex] + 0.5f);
+		float2 SegmentEnd = float2((float)EndSampleIndex + 0.5f, LineData[EndSampleIndex] + 0.5f);
+
+		float Distance = DistanceToSegment(Pixel, SegmentStart, SegmentEnd);
+		MinDistance = min(MinDistance, Distance);
+	}
+
+	float Alpha = 1.0f - smoothstep(HalfWidth - AntiAliasWidth, HalfWidth + AntiAliasWidth, MinDistance);
+
+	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
+	float4 LineColor = float4(0.0f, 1.0f, 1.0f, 1.0f);
+	RenderTarget[PixelCoord] = lerp(BackgroundColor, LineColor, Alpha);
 }

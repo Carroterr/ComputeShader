@@ -46,6 +46,10 @@ public:
 	END_SHADER_PARAMETER_STRUCT()
 
 public:
+	static constexpr int32 ThreadGroupSizeX = 32;
+	static constexpr int32 ThreadGroupSizeY = 32;
+	static constexpr int32 ThreadGroupSizeZ = 1;
+
 	/**
 	 * 判断某个 Shader 变体是否需要编译。
 	 * 当前示例返回 true，表示所有平台/特性级别都尝试编译。
@@ -70,9 +74,9 @@ public:
 		const FPermutationDomain PermutationVector(Parameters.PermutationId);
 
 		// 供 usf 中 numthreads 使用的宏定义。
-		OutEnvironment.SetDefine(TEXT("THREADS_X"), 32);
-		OutEnvironment.SetDefine(TEXT("THREADS_Y"), 32);
-		OutEnvironment.SetDefine(TEXT("THREADS_Z"), 1);
+		OutEnvironment.SetDefine(TEXT("THREADS_X"), ThreadGroupSizeX);
+		OutEnvironment.SetDefine(TEXT("THREADS_Y"), ThreadGroupSizeY);
+		OutEnvironment.SetDefine(TEXT("THREADS_Z"), ThreadGroupSizeZ);
 	}
 };
 
@@ -98,5 +102,5 @@ private:
 	UTextureRenderTarget2D* RenderTarget;
 
 	TArray<float> LineDrawDesc;
-	TArray<int> LineData;
+	TArray<float> LineData;
 };

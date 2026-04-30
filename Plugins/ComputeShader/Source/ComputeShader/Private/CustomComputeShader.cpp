@@ -92,15 +92,17 @@ void UCustomShader::ExecuteComputeShader(const TArray<float>& InValue)
 
 					// 同理：上传波形采样数据 LineData。
 					FRDGBufferRef LineDataBuffer = CreateUploadBuffer(GraphBuilder, TEXT("LineDataBuffer"), sizeof(float), LineData.Num(), LineData.GetData(),
-					                                                  sizeof(int) * LineData.Num());
+					                                                  sizeof(float) * LineData.Num());
 
 					// 绑定 LineData 的 SRV，对应 usf 中：Buffer<float> LineData;
 					PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer, PF_R32_FLOAT));
 
 					// 根据渲染目标尺寸计算 Dispatch 的线程组数量。
-					// 这里使用 UE 推荐的 kGolden2DGroupSize；它应与 usf 的 numthreads 宏协同工作，
-					// 保证覆盖整张目标纹理，并由 shader 内边界判断处理越界线程。
-					auto GroupCount = FComputeShaderUtils::GetGroupCount(FIntVector(RenderTarget->SizeX, RenderTarget->SizeY, 1), FComputeShaderUtils::kGolden2DGroupSize);
+					// 这里使用和 usf numthreads 宏一致的线程组尺寸，保证覆盖整张目标纹理，
+					// 并由 shader 内边界判断处理越界线程。
+					auto GroupCount = FComputeShaderUtils::GetGroupCount(
+						FIntVector(RenderTarget->SizeX, RenderTarget->SizeY, 1),
+						FIntVector(FCustomComputeShader::ThreadGroupSizeX, FCustomComputeShader::ThreadGroupSizeY, FCustomComputeShader::ThreadGroupSizeZ));
 					GraphBuilder.AddPass(
 						RDG_EVENT_NAME("SimpleComputeShader"),
 						PassParameters,
@@ -144,7 +146,7 @@ void UCustomShader::SetSinWaveData(float offset, float coefficient)
 {
 	for (int32 i = 0; i < 1024; ++i)
 	{
-		int Value = static_cast<int>(FMath::Sin(FMath::DegreesToRadians(i * coefficient) + offset) * 300 + 500);
+		float Value = FMath::Sin(FMath::DegreesToRadians(i * coefficient) + offset) * 300.0f + 500.0f;
 		LineData[i] = Value;
 	}
 }
