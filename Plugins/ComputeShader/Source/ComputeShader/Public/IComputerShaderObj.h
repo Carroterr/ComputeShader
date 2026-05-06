@@ -27,4 +27,7 @@ public:
 private:
 	UPROPERTY(Transient)
 	UTextureRenderTarget2D* RenderTarget = nullptr;
+	
+	TArray<float> LineDrawDesc;
+	TArray<float> LineData;
 };

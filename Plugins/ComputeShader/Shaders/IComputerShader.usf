@@ -1,0 +1,51 @@
+#include "/Engine/Public/Platform.ush"
+
+RWTexture2D<float4> RenderTarget;
+Buffer<float> LineDrawDesc;
+Buffer<float> LineData;
+
+
+float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
+{
+	float2 Segment = End - Start;
+	float SegmentLengthSquared = max(dot(Segment, Segment), 0.0001f);
+	float T = saturate(dot(Pixel - Start, Segment) / SegmentLengthSquared);
+	float2 Closest = Start + Segment * T;
+	return length(Pixel - Closest);
+}
+
+
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	float Width = LineDrawDesc[0];
+	float Height = LineDrawDesc[1];
+	float LineWidth = 1.0f;
+	float HalfWidth = LineWidth * 0.5f;
+	// float AntiAliasWidth = 1.0f;
+
+	uint2 PixelCoord = DispatchThreadId.xy;
+
+	if (PixelCoord.x >= Width || PixelCoord.y >= Height || Width < 1.0f)
+	{
+		return;
+	}
+
+	uint BaseIndex = PixelCoord.x * 2;
+	float Y0 = LineData[BaseIndex];
+	float Y1 = LineData[BaseIndex + 1];
+	float MinY = min(Y0, Y1);
+	float MaxY = max(Y0, Y1);
+
+	float2 Pixel = float2((float)PixelCoord.x + 0.5f, (float)PixelCoord.y + 0.5f);
+	float2 SegmentStart = float2((float)PixelCoord.x + 0.5f, MinY + 0.5f);
+	float2 SegmentEnd = float2((float)PixelCoord.x + 0.5f, MaxY + 0.5f);
+	float MinDistance = DistanceToSegment(Pixel, SegmentStart, SegmentEnd);
+
+	// float Alpha = 1.0f - smoothstep(HalfWidth - AntiAliasWidth, HalfWidth + AntiAliasWidth, MinDistance);
+	float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
+
+	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
+	float4 LineColor = float4(0.0f, 1.0f, 1.0f, 1.0f);
+	RenderTarget[PixelCoord] = lerp(BackgroundColor, LineColor, Alpha);
+}

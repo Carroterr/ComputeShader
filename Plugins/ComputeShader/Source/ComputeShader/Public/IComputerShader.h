@@ -10,9 +10,13 @@ public:
 	DECLARE_GLOBAL_SHADER(FIComputerShader);
 	SHADER_USE_PARAMETER_STRUCT(FIComputerShader, FGlobalShader);
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters,)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D, RenderTarget)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, DrawDesc)
+		// 输入 SRV：线条绘制描述数据（宽高、偏移等，具体解释由 usf 侧决定）。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, LineDrawDesc)
+
+		// 输入 SRV：每个采样点的数据（本示例中是波形数据）。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, LineData)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static constexpr int32 ThreadGroupSizeX = 8;

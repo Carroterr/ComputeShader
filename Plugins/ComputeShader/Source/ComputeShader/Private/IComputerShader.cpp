@@ -2,7 +2,7 @@
 
 IMPLEMENT_GLOBAL_SHADER(
 	FIComputerShader,
-	"/ComputeShaderShaders/CurvePlotting_MXAAShader.usf",
+	"/ComputeShaderShaders/IComputerShader.usf",
 	"IComputerShader",
 	SF_Compute
 );

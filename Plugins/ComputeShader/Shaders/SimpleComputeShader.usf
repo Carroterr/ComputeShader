@@ -20,7 +20,7 @@ void SimpleComputeShader(
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
-	float LineWidth = 2.0f;
+	float LineWidth = 1.0f;
 	float HalfWidth = LineWidth * 0.5f;
 	float AntiAliasWidth = 1.0f;
 
@@ -50,6 +50,18 @@ void SimpleComputeShader(
 
 		float2 SegmentStart = float2((float)StartSampleIndex + 0.5f, LineData[StartSampleIndex] + 0.5f);
 		float2 SegmentEnd = float2((float)EndSampleIndex + 0.5f, LineData[EndSampleIndex] + 0.5f);
+
+		float BoundsExpand = HalfWidth + AntiAliasWidth;
+
+		float MinX = min(SegmentStart.x, SegmentEnd.x) - BoundsExpand;
+		float MaxX = max(SegmentStart.x, SegmentEnd.x) + BoundsExpand;
+		float MinY = min(SegmentStart.y, SegmentEnd.y) - BoundsExpand;
+		float MaxY = max(SegmentStart.y, SegmentEnd.y) + BoundsExpand;
+
+		if (Pixel.x < MinX || Pixel.x > MaxX || Pixel.y < MinY || Pixel.y > MaxY)
+		{
+			continue;
+		}
 
 		float Distance = DistanceToSegment(Pixel, SegmentStart, SegmentEnd);
 		MinDistance = min(MinDistance, Distance);
