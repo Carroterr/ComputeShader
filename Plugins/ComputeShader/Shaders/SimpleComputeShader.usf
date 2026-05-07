@@ -51,7 +51,7 @@ void SimpleComputeShader(
 		float2 SegmentStart = float2((float)StartSampleIndex + 0.5f, LineData[StartSampleIndex] + 0.5f);
 		float2 SegmentEnd = float2((float)EndSampleIndex + 0.5f, LineData[EndSampleIndex] + 0.5f);
 
-		float BoundsExpand = HalfWidth + AntiAliasWidth;
+		float BoundsExpand = HalfWidth;
 
 		float MinX = min(SegmentStart.x, SegmentEnd.x) - BoundsExpand;
 		float MaxX = max(SegmentStart.x, SegmentEnd.x) + BoundsExpand;
@@ -68,6 +68,7 @@ void SimpleComputeShader(
 	}
 
 	float Alpha = 1.0f - smoothstep(HalfWidth - AntiAliasWidth, HalfWidth + AntiAliasWidth, MinDistance);
+	//float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
 
 	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
 	float4 LineColor = float4(0.0f, 1.0f, 1.0f, 1.0f);

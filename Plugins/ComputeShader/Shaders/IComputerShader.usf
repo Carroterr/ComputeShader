@@ -14,15 +14,36 @@ float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
 	return length(Pixel - Closest);
 }
 
+void AccumulateSegmentDistance(
+	inout float MinDistance,
+	float2 Pixel,
+	float2 SegmentStart,
+	float2 SegmentEnd,
+	float BoundsExpand)
+{
+	float MinX = min(SegmentStart.x, SegmentEnd.x) - BoundsExpand;
+	float MaxX = max(SegmentStart.x, SegmentEnd.x) + BoundsExpand;
+	float MinY = min(SegmentStart.y, SegmentEnd.y) - BoundsExpand;
+	float MaxY = max(SegmentStart.y, SegmentEnd.y) + BoundsExpand;
+
+	if (Pixel.x < MinX || Pixel.x > MaxX || Pixel.y < MinY || Pixel.y > MaxY)
+	{
+		return;
+	}
+
+	MinDistance = min(MinDistance, DistanceToSegment(Pixel, SegmentStart, SegmentEnd));
+}
+
 
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
+	int SegmentsPerBucket = (int)LineDrawDesc[2];
 	float LineWidth = 1.0f;
 	float HalfWidth = LineWidth * 0.5f;
-	// float AntiAliasWidth = 1.0f;
+	float AntiAliasWidth = 1.0f;
 
 	uint2 PixelCoord = DispatchThreadId.xy;
 
@@ -31,19 +52,27 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
-	uint BaseIndex = PixelCoord.x * 2;
-	float Y0 = LineData[BaseIndex];
-	float Y1 = LineData[BaseIndex + 1];
-	float MinY = min(Y0, Y1);
-	float MaxY = max(Y0, Y1);
-
 	float2 Pixel = float2((float)PixelCoord.x + 0.5f, (float)PixelCoord.y + 0.5f);
-	float2 SegmentStart = float2((float)PixelCoord.x + 0.5f, MinY + 0.5f);
-	float2 SegmentEnd = float2((float)PixelCoord.x + 0.5f, MaxY + 0.5f);
-	float MinDistance = DistanceToSegment(Pixel, SegmentStart, SegmentEnd);
+	float MinDistance = 100000.0f;
+	float BoundsExpand = HalfWidth + AntiAliasWidth;
 
-	// float Alpha = 1.0f - smoothstep(HalfWidth - AntiAliasWidth, HalfWidth + AntiAliasWidth, MinDistance);
-	float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
+	uint BucketBase = PixelCoord.x * (uint)SegmentsPerBucket * 4;
+	for (int SegmentIndex = 0; SegmentIndex < SegmentsPerBucket; ++SegmentIndex)
+	{
+		uint BaseIndex = BucketBase + (uint)SegmentIndex * 4;
+		float X0 = LineData[BaseIndex];
+		if (X0 < 0.0f)
+		{
+			continue;
+		}
+
+		float2 SegmentStart = float2(X0, LineData[BaseIndex + 1]);
+		float2 SegmentEnd = float2(LineData[BaseIndex + 2], LineData[BaseIndex + 3]);
+		AccumulateSegmentDistance(MinDistance, Pixel, SegmentStart, SegmentEnd, BoundsExpand);
+	}
+
+	float Alpha = 1.0f - smoothstep(HalfWidth, HalfWidth + AntiAliasWidth, MinDistance);
+	//float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
 
 	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
 	float4 LineColor = float4(0.0f, 1.0f, 1.0f, 1.0f);
