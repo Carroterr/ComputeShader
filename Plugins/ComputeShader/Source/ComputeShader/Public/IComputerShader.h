@@ -17,6 +17,12 @@ public:
 
 		// 输入 SRV：每个采样点的数据（本示例中是波形数据）。
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, LineData)
+
+		// 每个屏幕 x bucket 的线段 offset/count。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, BucketRanges)
+
+		// 每条曲线一组颜色，CurveColors[CurveIndex] 对应一组数据。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, CurveColors)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static constexpr int32 ThreadGroupSizeX = 8;

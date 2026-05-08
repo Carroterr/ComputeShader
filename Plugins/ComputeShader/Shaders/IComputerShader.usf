@@ -3,6 +3,8 @@
 RWTexture2D<float4> RenderTarget;
 Buffer<float> LineDrawDesc;
 Buffer<float> LineData;
+Buffer<uint> BucketRanges;
+Buffer<float4> CurveColors;
 
 
 float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
@@ -16,9 +18,11 @@ float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
 
 void AccumulateSegmentDistance(
 	inout float MinDistance,
+	inout uint BestCurveIndex,
 	float2 Pixel,
 	float2 SegmentStart,
 	float2 SegmentEnd,
+	uint CurveIndex,
 	float BoundsExpand)
 {
 	float MinX = min(SegmentStart.x, SegmentEnd.x) - BoundsExpand;
@@ -31,16 +35,27 @@ void AccumulateSegmentDistance(
 		return;
 	}
 
-	MinDistance = min(MinDistance, DistanceToSegment(Pixel, SegmentStart, SegmentEnd));
+	float Distance = DistanceToSegment(Pixel, SegmentStart, SegmentEnd);
+	if (Distance < MinDistance)
+	{
+		MinDistance = Distance;
+		BestCurveIndex = CurveIndex;
+	}
 }
 
+float4 LoadCurveColor(uint CurveIndex, uint CurveCount)
+{
+	uint SafeCurveIndex = min(CurveIndex, max(CurveCount, 1u) - 1u);
+	return CurveColors[SafeCurveIndex];
+}
 
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
 void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
-	int SegmentsPerBucket = (int)LineDrawDesc[2];
+	uint SegmentFloatCount = max(uint(LineDrawDesc[2]), 5u);
+	uint CurveCount = max(uint(LineDrawDesc[3]), 1u);
 	float LineWidth = 1.0f;
 	float HalfWidth = LineWidth * 0.5f;
 	float AntiAliasWidth = 1.0f;
@@ -54,27 +69,27 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	float2 Pixel = float2((float)PixelCoord.x + 0.5f, (float)PixelCoord.y + 0.5f);
 	float MinDistance = 100000.0f;
+	uint BestCurveIndex = 0u;
 	float BoundsExpand = HalfWidth + AntiAliasWidth;
 
-	uint BucketBase = PixelCoord.x * (uint)SegmentsPerBucket * 4;
-	for (int SegmentIndex = 0; SegmentIndex < SegmentsPerBucket; ++SegmentIndex)
-	{
-		uint BaseIndex = BucketBase + (uint)SegmentIndex * 4;
-		float X0 = LineData[BaseIndex];
-		if (X0 < 0.0f)
-		{
-			continue;
-		}
+	uint RangeBase = PixelCoord.x * 2u;
+	uint SegmentOffset = BucketRanges[RangeBase];
+	uint SegmentCount = BucketRanges[RangeBase + 1u];
 
-		float2 SegmentStart = float2(X0, LineData[BaseIndex + 1]);
-		float2 SegmentEnd = float2(LineData[BaseIndex + 2], LineData[BaseIndex + 3]);
-		AccumulateSegmentDistance(MinDistance, Pixel, SegmentStart, SegmentEnd, BoundsExpand);
+	for (uint SegmentIndex = 0u; SegmentIndex < SegmentCount; ++SegmentIndex)
+	{
+		uint BaseIndex = (SegmentOffset + SegmentIndex) * SegmentFloatCount;
+
+		float2 SegmentStart = float2(LineData[BaseIndex], LineData[BaseIndex + 1u]);
+		float2 SegmentEnd = float2(LineData[BaseIndex + 2u], LineData[BaseIndex + 3u]);
+		uint CurveIndex = min(uint(max(LineData[BaseIndex + 4u], 0.0f)), CurveCount - 1u);
+		AccumulateSegmentDistance(MinDistance, BestCurveIndex, Pixel, SegmentStart, SegmentEnd, CurveIndex, BoundsExpand);
 	}
 
 	float Alpha = 1.0f - smoothstep(HalfWidth, HalfWidth + AntiAliasWidth, MinDistance);
 	//float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
 
 	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
-	float4 LineColor = float4(0.0f, 1.0f, 1.0f, 1.0f);
-	RenderTarget[PixelCoord] = lerp(BackgroundColor, LineColor, Alpha);
+	float4 LineColor = LoadCurveColor(BestCurveIndex, CurveCount);
+	RenderTarget[PixelCoord] = lerp(BackgroundColor, LineColor, Alpha * LineColor.a);
 }
