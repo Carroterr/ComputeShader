@@ -1,8 +1,18 @@
 #include "/Engine/Public/Platform.ush"
 
+// 必须和 C++ 端 FCurveSegmentGPU 完全一致（32B / 8 floats）。
+struct FCurveSegment
+{
+	float4 Endpoints; // x0, y0, x1, y1
+	uint CurveIndex;
+	uint _Pad0;
+	uint _Pad1;
+	uint _Pad2;
+};
+
 RWTexture2D<float4> RenderTarget;
 Buffer<float> LineDrawDesc;
-Buffer<float> LineData;
+StructuredBuffer<FCurveSegment> LineData;
 Buffer<uint> BucketRanges;
 Buffer<float4> CurveColors;
 
@@ -25,12 +35,10 @@ void AccumulateSegmentDistance(
 	uint CurveIndex,
 	float BoundsExpand)
 {
-	float MinX = min(SegmentStart.x, SegmentEnd.x) - BoundsExpand;
-	float MaxX = max(SegmentStart.x, SegmentEnd.x) + BoundsExpand;
+	// X 方向已经由 CPU 端按 bucket 预筛过，这里只做 Y 方向剔除。
 	float MinY = min(SegmentStart.y, SegmentEnd.y) - BoundsExpand;
 	float MaxY = max(SegmentStart.y, SegmentEnd.y) + BoundsExpand;
-
-	if (Pixel.x < MinX || Pixel.x > MaxX || Pixel.y < MinY || Pixel.y > MaxY)
+	if (Pixel.y < MinY || Pixel.y > MaxY)
 	{
 		return;
 	}
@@ -54,7 +62,6 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
-	uint SegmentFloatCount = max(uint(LineDrawDesc[2]), 5u);
 	uint CurveCount = max(uint(LineDrawDesc[3]), 1u);
 	float LineWidth = 1.0f;
 	float HalfWidth = LineWidth * 0.5f;
@@ -72,17 +79,17 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 	uint BestCurveIndex = 0u;
 	float BoundsExpand = HalfWidth + AntiAliasWidth;
 
+	// 整个 warp 共享同一个 x bucket，下面的 SegmentOffset/Count 实质是常量广播。
 	uint RangeBase = PixelCoord.x * 2u;
 	uint SegmentOffset = BucketRanges[RangeBase];
 	uint SegmentCount = BucketRanges[RangeBase + 1u];
 
 	for (uint SegmentIndex = 0u; SegmentIndex < SegmentCount; ++SegmentIndex)
 	{
-		uint BaseIndex = (SegmentOffset + SegmentIndex) * SegmentFloatCount;
-
-		float2 SegmentStart = float2(LineData[BaseIndex], LineData[BaseIndex + 1u]);
-		float2 SegmentEnd = float2(LineData[BaseIndex + 2u], LineData[BaseIndex + 3u]);
-		uint CurveIndex = min(uint(max(LineData[BaseIndex + 4u], 0.0f)), CurveCount - 1u);
+		FCurveSegment Segment = LineData[SegmentOffset + SegmentIndex];
+		float2 SegmentStart = Segment.Endpoints.xy;
+		float2 SegmentEnd = Segment.Endpoints.zw;
+		uint CurveIndex = min(Segment.CurveIndex, CurveCount - 1u);
 		AccumulateSegmentDistance(MinDistance, BestCurveIndex, Pixel, SegmentStart, SegmentEnd, CurveIndex, BoundsExpand);
 	}
 

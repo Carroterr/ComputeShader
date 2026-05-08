@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "CoreMinimal.h"
+#include "IComputerShader.h"
 #include "UObject/Object.h"
 #include "IComputerShaderObj.generated.h"
 
@@ -68,7 +69,7 @@ private:
 	UTextureRenderTarget2D* RenderTarget = nullptr;
 	
 	TArray<float> LineDrawDesc;
-	TArray<float> LineData;
+	TArray<FCurveSegmentGPU> LineData;
 	TArray<uint32> BucketRanges;
 	TArray<FLinearColor> CurveColors;
 };

@@ -4,6 +4,20 @@
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 
+// GPU 端线段布局，必须和 .usf 里的 FCurveSegment 完全一致。
+// 32 字节对齐，单次取数即可拿到一条线段的全部数据。
+struct FCurveSegmentGPU
+{
+	float X0;
+	float Y0;
+	float X1;
+	float Y1;
+	uint32 CurveIndex;
+	uint32 _Pad0;
+	uint32 _Pad1;
+	uint32 _Pad2;
+};
+
 class COMPUTESHADER_API FIComputerShader : public FGlobalShader
 {
 public:
@@ -15,8 +29,8 @@ public:
 		// 输入 SRV：线条绘制描述数据（宽高、偏移等，具体解释由 usf 侧决定）。
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, LineDrawDesc)
 
-		// 输入 SRV：每个采样点的数据（本示例中是波形数据）。
-		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, LineData)
+		// 输入 SRV：每条线段打包成 FCurveSegmentGPU，单次取数完成。
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FCurveSegmentGPU>, LineData)
 
 		// 每个屏幕 x bucket 的线段 offset/count。
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, BucketRanges)
@@ -25,8 +39,9 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, CurveColors)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static constexpr int32 ThreadGroupSizeX = 8;
-	static constexpr int32 ThreadGroupSizeY = 8;
+	// 竖条线程组：整 warp 共享同一个 x bucket，循环长度一致，无 divergence。
+	static constexpr int32 ThreadGroupSizeX = 1;
+	static constexpr int32 ThreadGroupSizeY = 64;
 	static constexpr int32 ThreadGroupSizeZ = 1;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

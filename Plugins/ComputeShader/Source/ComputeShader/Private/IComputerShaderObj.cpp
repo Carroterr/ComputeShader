@@ -9,7 +9,6 @@ class FIComputerShader;
 namespace
 {
 	constexpr int32 GLineDrawDescFloatCount = 4;
-	constexpr int32 GSegmentFloatCount = 5;
 	constexpr int32 GBucketRangeUintCount = 2;
 	constexpr int32 GLegacySourceCount = 5000;
 	constexpr float GLegacySinAmplitude = 1000.0f;
@@ -67,19 +66,19 @@ namespace
 		}
 	}
 
-	// Stores render size, segment stride, and curve count for the shader.
+	// Stores render size and curve count for the shader. Index 2 is reserved (legacy stride field, unused).
 	void UpdateLineDrawDesc(TArray<float>& OutLineDrawDesc, int32 Width, int32 Height, int32 CurveCount)
 	{
 		OutLineDrawDesc.SetNumZeroed(GLineDrawDescFloatCount);
 		OutLineDrawDesc[0] = static_cast<float>(Width);
 		OutLineDrawDesc[1] = static_cast<float>(Height);
-		OutLineDrawDesc[2] = static_cast<float>(GSegmentFloatCount);
+		OutLineDrawDesc[2] = 0.0f;
 		OutLineDrawDesc[3] = static_cast<float>(FMath::Max(1, CurveCount));
 	}
 
 	// Creates safe non-empty buffers for initialization and invalid input cases.
 	void ResetCurveBuffers(int32 Width, int32 Height, const FIComputerCurveRenderConfig& Config,
-	                       TArray<float>& OutLineDrawDesc, TArray<float>& OutLineData,
+	                       TArray<float>& OutLineDrawDesc, TArray<FCurveSegmentGPU>& OutLineData,
 	                       TArray<uint32>& OutBucketRanges, TArray<FLinearColor>& OutCurveColors)
 	{
 		const int32 SafeWidth = FMath::Max(1, Width);
@@ -88,8 +87,8 @@ namespace
 
 		UpdateLineDrawDesc(OutLineDrawDesc, SafeWidth, SafeHeight, CurveCount);
 
-		OutLineData.Reset(GSegmentFloatCount);
-		OutLineData.AddZeroed(GSegmentFloatCount);
+		OutLineData.Reset(1);
+		OutLineData.AddZeroed(1);
 
 		OutBucketRanges.SetNumZeroed(SafeWidth * GBucketRangeUintCount);
 		BuildCurveColors(Config, OutCurveColors);
@@ -229,9 +228,9 @@ namespace
 		}
 	}
 
-	// Flattens per-column buckets into GPU buffers: LineData plus BucketRanges offset/count pairs.
+	// Flattens per-column buckets into GPU buffers: LineData (struct per segment) plus BucketRanges offset/count pairs.
 	void FlattenBuckets(const TArray<TArray<FCurveSegment>>& BucketSegments, TArray<uint32>& OutBucketRanges,
-	                    TArray<float>& OutLineData)
+	                    TArray<FCurveSegmentGPU>& OutLineData)
 	{
 		const int32 Width = BucketSegments.Num();
 		int32 TotalSegmentCount = 0;
@@ -241,29 +240,33 @@ namespace
 		}
 
 		OutBucketRanges.SetNumZeroed(Width * GBucketRangeUintCount);
-		OutLineData.Reset(FMath::Max(GSegmentFloatCount, TotalSegmentCount * GSegmentFloatCount));
+		OutLineData.Reset(FMath::Max(1, TotalSegmentCount));
 
 		for (int32 BucketIndex = 0; BucketIndex < Width; ++BucketIndex)
 		{
 			const TArray<FCurveSegment>& Bucket = BucketSegments[BucketIndex];
-			const uint32 SegmentOffset = static_cast<uint32>(OutLineData.Num() / GSegmentFloatCount);
+			const uint32 SegmentOffset = static_cast<uint32>(OutLineData.Num());
 
 			OutBucketRanges[BucketIndex * GBucketRangeUintCount] = SegmentOffset;
 			OutBucketRanges[BucketIndex * GBucketRangeUintCount + 1] = static_cast<uint32>(Bucket.Num());
 
 			for (const FCurveSegment& Segment : Bucket)
 			{
-				OutLineData.Add(Segment.X0);
-				OutLineData.Add(Segment.Y0);
-				OutLineData.Add(Segment.X1);
-				OutLineData.Add(Segment.Y1);
-				OutLineData.Add(static_cast<float>(Segment.CurveIndex));
+				FCurveSegmentGPU& Out = OutLineData.AddDefaulted_GetRef();
+				Out.X0 = Segment.X0;
+				Out.Y0 = Segment.Y0;
+				Out.X1 = Segment.X1;
+				Out.Y1 = Segment.Y1;
+				Out.CurveIndex = Segment.CurveIndex;
+				Out._Pad0 = 0;
+				Out._Pad1 = 0;
+				Out._Pad2 = 0;
 			}
 		}
 
 		if (OutLineData.Num() == 0)
 		{
-			OutLineData.AddZeroed(GSegmentFloatCount);
+			OutLineData.AddZeroed(1);
 		}
 	}
 
@@ -323,12 +326,12 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	}
 	LineDrawDescCopy[0] = static_cast<float>(Width);
 	LineDrawDescCopy[1] = static_cast<float>(Height);
-	LineDrawDescCopy[2] = static_cast<float>(GSegmentFloatCount);
+	LineDrawDescCopy[2] = 0.0f;
 
-	TArray<float> LineDataCopy = LineData;
+	TArray<FCurveSegmentGPU> LineDataCopy = LineData;
 	if (LineDataCopy.Num() == 0)
 	{
-		LineDataCopy.AddZeroed(GSegmentFloatCount);
+		LineDataCopy.AddZeroed(1);
 	}
 
 	TArray<uint32> BucketRangesCopy = BucketRanges;
@@ -371,10 +374,11 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 			                                                      sizeof(float) * LineDrawDescCopy.Num());
 			PassParameters->LineDrawDesc = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDrawDescBuffer, PF_R32_FLOAT));
 
-			FRDGBufferRef LineDataBuffer = CreateUploadBuffer(GraphBuilder, TEXT("LineDataBuffer"), sizeof(float),
-			                                                  LineDataCopy.Num(), LineDataCopy.GetData(),
-			                                                  sizeof(float) * LineDataCopy.Num());
-			PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer, PF_R32_FLOAT));
+			FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
+			                                                      sizeof(FCurveSegmentGPU), LineDataCopy.Num(),
+			                                                      LineDataCopy.GetData(),
+			                                                      sizeof(FCurveSegmentGPU) * LineDataCopy.Num());
+			PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer));
 
 			FRDGBufferRef BucketRangesBuffer = CreateUploadBuffer(GraphBuilder, TEXT("BucketRangesBuffer"),
 			                                                      sizeof(uint32), BucketRangesCopy.Num(),
