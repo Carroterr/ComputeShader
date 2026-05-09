@@ -2,6 +2,7 @@
 
 #include "IComputerShader.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "RenderGraphUtils.h"
 
 class FIComputerShader;
@@ -284,6 +285,72 @@ namespace
 	}
 }
 
+TArray<FCurveSegmentGPU>& UIComputerShaderObj::GetWritableLineDataBuffer()
+{
+	auto EnsureBuffer = [](TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>& Buffer)
+		-> TArray<FCurveSegmentGPU>&
+	{
+		if (!Buffer.IsValid())
+		{
+			Buffer = MakeShared<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>();
+		}
+
+		return *Buffer;
+	};
+
+	auto IsBufferWritable = [this](int32 BufferIndex)
+	{
+		return BufferIndex != LineDataReadyBufferIndex && LineDataUploadFences[BufferIndex].IsFenceComplete();
+	};
+
+	if (!IsBufferWritable(LineDataWriteBufferIndex))
+	{
+		for (int32 Offset = 1; Offset < LineDataUploadBufferCount; ++Offset)
+		{
+			const int32 CandidateIndex = (LineDataWriteBufferIndex + Offset) % LineDataUploadBufferCount;
+			if (IsBufferWritable(CandidateIndex))
+			{
+				LineDataWriteBufferIndex = CandidateIndex;
+				break;
+			}
+		}
+	}
+
+	if (!IsBufferWritable(LineDataWriteBufferIndex))
+	{
+		int32 WaitBufferIndex = INDEX_NONE;
+		for (int32 BufferIndex = 0; BufferIndex < LineDataUploadBufferCount; ++BufferIndex)
+		{
+			if (BufferIndex != LineDataReadyBufferIndex)
+			{
+				WaitBufferIndex = BufferIndex;
+				break;
+			}
+		}
+
+		if (WaitBufferIndex == INDEX_NONE)
+		{
+			WaitBufferIndex = LineDataWriteBufferIndex;
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.WaitForLineDataUploadBuffer");
+			LineDataUploadFences[WaitBufferIndex].Wait();
+		}
+
+		LineDataWriteBufferIndex = WaitBufferIndex;
+	}
+
+	return EnsureBuffer(LineDataBuffers[LineDataWriteBufferIndex]);
+}
+
+void UIComputerShaderObj::MarkLineDataReadyForUpload()
+{
+	bHasPendingLineDataUpload = true;
+	LineDataReadyBufferIndex = LineDataWriteBufferIndex;
+	LineDataWriteBufferIndex = (LineDataWriteBufferIndex + 1) % LineDataUploadBufferCount;
+}
+
 void UIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
 {
 	RenderTarget = NewObject<UTextureRenderTarget2D>(this);
@@ -293,7 +360,9 @@ void UIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
 	RenderTarget->UpdateResourceImmediate(true);
 
 	FIComputerCurveRenderConfig DefaultConfig;
-	ResetCurveBuffers(Width, Height, DefaultConfig, LineDrawDesc, LineData, BucketRanges, CurveColors);
+	TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
+	ResetCurveBuffers(Width, Height, DefaultConfig, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
+	MarkLineDataReadyForUpload();
 }
 
 UTextureRenderTarget2D* UIComputerShaderObj::GetRenderTarget() const
@@ -308,118 +377,194 @@ void UIComputerShaderObj::Execute()
 
 void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU");
+
 	if (!RenderTarget)
 	{
 		return;
 	}
 
-	FTextureRenderTargetResource* RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* RenderTargetResource = nullptr;
+	int32 Width = 0;
+	int32 Height = 0;
 
-	const int32 Width = RenderTarget->SizeX;
-	const int32 Height = RenderTarget->SizeY;
-
-	TArray<float> LineDrawDescCopy = LineDrawDesc;
-	if (LineDrawDescCopy.Num() != GLineDrawDescFloatCount)
 	{
-		FIComputerCurveRenderConfig DefaultConfig;
-		UpdateLineDrawDesc(LineDrawDescCopy, Width, Height, DefaultConfig.CurveCount);
-	}
-	LineDrawDescCopy[0] = static_cast<float>(Width);
-	LineDrawDescCopy[1] = static_cast<float>(Height);
-	LineDrawDescCopy[2] = 0.0f;
-
-	TArray<FCurveSegmentGPU> LineDataCopy = LineData;
-	if (LineDataCopy.Num() == 0)
-	{
-		LineDataCopy.AddZeroed(1);
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.GetRenderTargetResource");
+		RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
+		Width = RenderTarget->SizeX;
+		Height = RenderTarget->SizeY;
 	}
 
-	TArray<uint32> BucketRangesCopy = BucketRanges;
-	const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * GBucketRangeUintCount;
-	if (BucketRangesCopy.Num() != ExpectedBucketRangeCount)
+	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
+	int32 LineDataUploadBufferIndex = INDEX_NONE;
 	{
-		BucketRangesCopy.SetNumZeroed(ExpectedBucketRangeCount);
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.UseLineDataBuffer");
+		if (!bHasPendingLineDataUpload || LineDataReadyBufferIndex == INDEX_NONE ||
+			!LineDataBuffers[LineDataReadyBufferIndex].IsValid())
+		{
+			return;
+		}
+
+		LineDataUploadBufferIndex = LineDataReadyBufferIndex;
+		LineDataUploadBuffer = LineDataBuffers[LineDataUploadBufferIndex];
+		if (LineDataUploadBuffer->Num() == 0)
+		{
+			LineDataUploadBuffer->AddZeroed(1);
+		}
+
+		bHasPendingLineDataUpload = false;
+		LineDataReadyBufferIndex = INDEX_NONE;
 	}
 
-	TArray<FLinearColor> CurveColorsCopy = CurveColors;
-	if (CurveColorsCopy.Num() == 0)
+	TArray<float> LineDrawDescCopy;
 	{
-		CurveColorsCopy.Add(GetDefaultCurveColor(0));
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyLineDrawDesc");
+		LineDrawDescCopy = LineDrawDesc;
+		if (LineDrawDescCopy.Num() != GLineDrawDescFloatCount)
+		{
+			FIComputerCurveRenderConfig DefaultConfig;
+			UpdateLineDrawDesc(LineDrawDescCopy, Width, Height, DefaultConfig.CurveCount);
+		}
+		LineDrawDescCopy[0] = static_cast<float>(Width);
+		LineDrawDescCopy[1] = static_cast<float>(Height);
+		LineDrawDescCopy[2] = 0.0f;
 	}
-	LineDrawDescCopy[3] = static_cast<float>(FMath::Max(1, CurveColorsCopy.Num()));
+
+	TArray<uint32> BucketRangesCopy;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyBucketRanges");
+		BucketRangesCopy = BucketRanges;
+		const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * GBucketRangeUintCount;
+		if (BucketRangesCopy.Num() != ExpectedBucketRangeCount)
+		{
+			BucketRangesCopy.SetNumZeroed(ExpectedBucketRangeCount);
+		}
+	}
+
+	TArray<FLinearColor> CurveColorsCopy;
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyCurveColors");
+		CurveColorsCopy = CurveColors;
+		if (CurveColorsCopy.Num() == 0)
+		{
+			CurveColorsCopy.Add(GetDefaultCurveColor(0));
+		}
+		LineDrawDescCopy[3] = static_cast<float>(FMath::Max(1, CurveColorsCopy.Num()));
+	}
 
 	// Stage 2: copy processed CPU buffers to the render thread, upload them with RDG, then dispatch.
-	ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
-		[RenderTargetResource, Width, Height, LineDrawDescCopy, LineDataCopy, BucketRangesCopy, CurveColorsCopy](
-			FRHICommandListImmediate& RHICmdList)
-		{
-			FRDGBuilder GraphBuilder(RHICmdList);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.EnqueueRenderCommand");
+		ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
+			[RenderTargetResource, Width, Height, LineDrawDescCopy = MoveTemp(LineDrawDescCopy),
+					LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
+					BucketRangesCopy = MoveTemp(BucketRangesCopy),
+					CurveColorsCopy = MoveTemp(CurveColorsCopy)](
+				FRHICommandListImmediate& RHICmdList)
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread");
 
-			TShaderMapRef<FIComputerShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FRDGBuilder GraphBuilder(RHICmdList);
 
-			FIComputerShader::FParameters* PassParameters =
-				GraphBuilder.AllocParameters<FIComputerShader::FParameters>();
+				TShaderMapRef<FIComputerShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
-			FRDGTextureRef TargetTexture = RegisterExternalTexture(
-				GraphBuilder,
-				RenderTargetResource->GetRenderTargetTexture(),
-				TEXT("IComputerShader_RenderTarget")
-			);
-
-			PassParameters->RenderTarget = GraphBuilder.CreateUAV(TargetTexture);
-
-			FRDGBufferRef LineDrawDescBuffer = CreateUploadBuffer(GraphBuilder, TEXT("LineDrawDescBuffer"),
-			                                                      sizeof(float), LineDrawDescCopy.Num(),
-			                                                      LineDrawDescCopy.GetData(),
-			                                                      sizeof(float) * LineDrawDescCopy.Num());
-			PassParameters->LineDrawDesc = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDrawDescBuffer, PF_R32_FLOAT));
-
-			FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
-			                                                      sizeof(FCurveSegmentGPU), LineDataCopy.Num(),
-			                                                      LineDataCopy.GetData(),
-			                                                      sizeof(FCurveSegmentGPU) * LineDataCopy.Num());
-			PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer));
-
-			FRDGBufferRef BucketRangesBuffer = CreateUploadBuffer(GraphBuilder, TEXT("BucketRangesBuffer"),
-			                                                      sizeof(uint32), BucketRangesCopy.Num(),
-			                                                      BucketRangesCopy.GetData(),
-			                                                      sizeof(uint32) * BucketRangesCopy.Num());
-			PassParameters->BucketRanges = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(BucketRangesBuffer, PF_R32_UINT));
-
-			FRDGBufferRef CurveColorsBuffer = CreateUploadBuffer(GraphBuilder, TEXT("CurveColorsBuffer"),
-			                                                     sizeof(FLinearColor), CurveColorsCopy.Num(),
-			                                                     CurveColorsCopy.GetData(),
-			                                                     sizeof(FLinearColor) * CurveColorsCopy.Num());
-			PassParameters->CurveColors = GraphBuilder.CreateSRV(
-				FRDGBufferSRVDesc(CurveColorsBuffer, PF_A32B32G32R32F));
-
-			const FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(
-				FIntVector(Width, Height, 1),
-				FIntVector(
-					FIComputerShader::ThreadGroupSizeX,
-					FIComputerShader::ThreadGroupSizeY,
-					FIComputerShader::ThreadGroupSizeZ
-				)
-			);
-
-			GraphBuilder.AddPass(
-				RDG_EVENT_NAME("IComputerShader"),
-				PassParameters,
-				ERDGPassFlags::AsyncCompute,
-				[ComputeShader, PassParameters, GroupCount](FRHIComputeCommandList& RHICmdList)
+				FIComputerShader::FParameters* PassParameters = nullptr;
 				{
-					FComputeShaderUtils::Dispatch(
-						RHICmdList,
-						ComputeShader,
-						*PassParameters,
-						GroupCount
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.AllocParameters");
+					PassParameters = GraphBuilder.AllocParameters<FIComputerShader::FParameters>();
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.RegisterTarget");
+					FRDGTextureRef TargetTexture = RegisterExternalTexture(
+						GraphBuilder,
+						RenderTargetResource->GetRenderTargetTexture(),
+						TEXT("IComputerShader_RenderTarget")
+					);
+
+					PassParameters->RenderTarget = GraphBuilder.CreateUAV(TargetTexture);
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineDrawDesc");
+					FRDGBufferRef LineDrawDescBuffer = CreateUploadBuffer(GraphBuilder, TEXT("LineDrawDescBuffer"),
+					                                                      sizeof(float), LineDrawDescCopy.Num(),
+					                                                      LineDrawDescCopy.GetData(),
+					                                                      sizeof(float) * LineDrawDescCopy.Num());
+					PassParameters->LineDrawDesc = GraphBuilder.CreateSRV(
+						FRDGBufferSRVDesc(LineDrawDescBuffer, PF_R32_FLOAT));
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
+					const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
+					FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
+					                                                      sizeof(FCurveSegmentGPU), LineDataUpload.Num(),
+					                                                      LineDataUpload.GetData(),
+					                                                      sizeof(FCurveSegmentGPU) * LineDataUpload.Num());
+					PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer));
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadBucketRanges");
+					FRDGBufferRef BucketRangesBuffer = CreateUploadBuffer(GraphBuilder, TEXT("BucketRangesBuffer"),
+					                                                      sizeof(uint32), BucketRangesCopy.Num(),
+					                                                      BucketRangesCopy.GetData(),
+					                                                      sizeof(uint32) * BucketRangesCopy.Num());
+					PassParameters->BucketRanges = GraphBuilder.CreateSRV(
+						FRDGBufferSRVDesc(BucketRangesBuffer, PF_R32_UINT));
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadCurveColors");
+					FRDGBufferRef CurveColorsBuffer = CreateUploadBuffer(GraphBuilder, TEXT("CurveColorsBuffer"),
+					                                                     sizeof(FLinearColor), CurveColorsCopy.Num(),
+					                                                     CurveColorsCopy.GetData(),
+					                                                     sizeof(FLinearColor) * CurveColorsCopy.Num());
+					PassParameters->CurveColors = GraphBuilder.CreateSRV(
+						FRDGBufferSRVDesc(CurveColorsBuffer, PF_A32B32G32R32F));
+				}
+
+				FIntVector GroupCount(0, 0, 0);
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.GetGroupCount");
+					GroupCount = FComputeShaderUtils::GetGroupCount(
+						FIntVector(Width, Height, 1),
+						FIntVector(
+							FIComputerShader::ThreadGroupSizeX,
+							FIComputerShader::ThreadGroupSizeY,
+							FIComputerShader::ThreadGroupSizeZ
+						)
 					);
 				}
-			);
 
-			GraphBuilder.Execute();
-		}
-	);
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.AddDispatchPass");
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("UIComputerShaderObj::UploadProcessedCurveDataToGPU.Dispatch"),
+						PassParameters,
+						ERDGPassFlags::AsyncCompute,
+						[ComputeShader, PassParameters, GroupCount](FRHIComputeCommandList& RHICmdList)
+						{
+							TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.DispatchRHI");
+							FComputeShaderUtils::Dispatch(
+								RHICmdList,
+								ComputeShader,
+								*PassParameters,
+								GroupCount
+							);
+						}
+					);
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.GraphExecute");
+					GraphBuilder.Execute();
+				}
+			}
+		);
+		LineDataUploadFences[LineDataUploadBufferIndex].BeginFence();
+	}
 }
 
 void UIComputerShaderObj::SetSinWaveData(float offset, float coefficient, float baseLineHeight)
@@ -456,6 +601,8 @@ void UIComputerShaderObj::SetCurveData(const TArray<float>& values, const FIComp
 
 bool UIComputerShaderObj::ProcessCurveData(const TArray<float>& values, const FIComputerCurveRenderConfig& config)
 {
+	TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData");
+
 	const int32 Width = RenderTarget ? RenderTarget->SizeX : 1024;
 	const int32 Height = RenderTarget ? RenderTarget->SizeY : 1024;
 	const int32 CurveCount = FMath::Max(1, config.CurveCount);
@@ -464,30 +611,49 @@ bool UIComputerShaderObj::ProcessCurveData(const TArray<float>& values, const FI
 
 	if (values.Num() < RequiredValueCount)
 	{
-		ResetCurveBuffers(Width, Height, config, LineDrawDesc, LineData, BucketRanges, CurveColors);
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.ResetInvalidInput");
+		TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
+		ResetCurveBuffers(Width, Height, config, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
+		MarkLineDataReadyForUpload();
 		return false;
 	}
 
-	UpdateLineDrawDesc(LineDrawDesc, Width, Height, CurveCount);
-	BuildCurveColors(config, CurveColors);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.UpdateDescriptors");
+		UpdateLineDrawDesc(LineDrawDesc, Width, Height, CurveCount);
+		BuildCurveColors(config, CurveColors);
+	}
 
 	// Stage 1: convert raw samples into draw-ready screen-space segments grouped by x bucket.
 	TArray<TArray<FCurveSegment>> BucketSegments;
-	BucketSegments.SetNum(FMath::Max(1, Width));
-
-	for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
 	{
-		const float BaseLine = config.BaseLineStart + static_cast<float>(CurveIndex) * config.BaseLineStep;
-		const int32 CurveValueOffset = CurveIndex * SampleCount;
-
-		auto GetSample = [&values, CurveValueOffset](int32 SourceIndex)
-		{
-			return values[CurveValueOffset + SourceIndex];
-		};
-
-		AddCurveToBuckets(CurveIndex, SampleCount, Width, BaseLine, config.ValueScale, GetSample, BucketSegments);
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.InitBucketSegments");
+		BucketSegments.SetNum(FMath::Max(1, Width));
 	}
 
-	FlattenBuckets(BucketSegments, BucketRanges, LineData);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.BuildBuckets");
+		for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.BuildBuckets.Curve");
+			const float BaseLine = config.BaseLineStart + static_cast<float>(CurveIndex) * config.BaseLineStep;
+			const int32 CurveValueOffset = CurveIndex * SampleCount;
+
+			auto GetSample = [&values, CurveValueOffset](int32 SourceIndex)
+			{
+				return values[CurveValueOffset + SourceIndex];
+			};
+
+			AddCurveToBuckets(CurveIndex, SampleCount, Width, BaseLine, config.ValueScale, GetSample, BucketSegments);
+		}
+	}
+
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.FlattenBuckets");
+		TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
+		FlattenBuckets(BucketSegments, BucketRanges, WritableLineData);
+		MarkLineDataReadyForUpload();
+	}
+
 	return true;
 }

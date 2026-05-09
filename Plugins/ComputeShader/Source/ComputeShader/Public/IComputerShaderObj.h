@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "IComputerShader.h"
+#include "RenderCommandFence.h"
 #include "UObject/Object.h"
 #include "IComputerShaderObj.generated.h"
 
@@ -65,11 +66,20 @@ public:
 	void SetCurveData(const TArray<float>& values, const FIComputerCurveRenderConfig& config);
 	
 private:
+	TArray<FCurveSegmentGPU>& GetWritableLineDataBuffer();
+	void MarkLineDataReadyForUpload();
+
 	UPROPERTY(Transient)
 	UTextureRenderTarget2D* RenderTarget = nullptr;
 	
+	enum { LineDataUploadBufferCount = 3 };
+
 	TArray<float> LineDrawDesc;
-	TArray<FCurveSegmentGPU> LineData;
+	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataBuffers[LineDataUploadBufferCount];
+	FRenderCommandFence LineDataUploadFences[LineDataUploadBufferCount];
+	int32 LineDataWriteBufferIndex = 0;
+	int32 LineDataReadyBufferIndex = INDEX_NONE;
+	bool bHasPendingLineDataUpload = false;
 	TArray<uint32> BucketRanges;
 	TArray<FLinearColor> CurveColors;
 };
