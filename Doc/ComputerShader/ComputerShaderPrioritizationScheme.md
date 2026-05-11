@@ -6,8 +6,8 @@
 |------|--------|----------|
 | `IComputerShader.h` | 线程组尺寸、Shader 参数类型、新增 `FCurveSegmentGPU` 结构体 | #1 线程组重排、#3 单次取段 |
 | `IComputerShader.usf` | 入口函数、`AccumulateSegmentDistance`、线段结构体定义 | #1 线程组重排、#2 删 X 包围盒、#3 单次取段 |
-| `IComputerShaderObj.h` | `LineData` 成员类型变更、新增 `IComputerShader.h` 引用 | #3 单次取段 |
-| `IComputerShaderObj.cpp` | `CreateUploadBuffer` → `CreateStructuredBuffer`、`FlattenBuckets` 重写、常量和辅助函数适配 | #3 单次取段 |
+| `IComputerShaderObj.h` | `LineData` 成员类型变更、新增 `IComputerShader.h` 引用；新增 `LineData` 三缓冲、上传 fence 和待上传标记 | #3 单次取段、#4 消除 Game Thread 大拷贝 |
+| `IComputerShaderObj.cpp` | `CreateUploadBuffer` → `CreateStructuredBuffer`、`FlattenBuckets` 重写、常量和辅助函数适配；上传时捕获 `TSharedPtr` 缓冲而不是复制整段 `LineData` | #3 单次取段、#4 消除 Game Thread 大拷贝 |
 
 ---
 
@@ -128,6 +128,142 @@ Padding 保证 32B 对齐（GPU 缓存行友好），同时让结构化 buffer �
 
 ---
 
+### #4 实时大数据流：消除 `CopyLineData` 的 Game Thread 大拷贝
+
+**背景：**
+
+实际运行时，`ProcessCurveData` 会面对大量定长曲线数据，并且数据每帧都在变化。此时不能依赖“BeginPlay 只上传一次”的静态数据策略，瓶颈会集中在每帧数据传输链路上。
+
+Unreal Insights 拆分后发现主要耗时来自：
+
+```text
+UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyLineData
+UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData
+```
+
+含义分别是：
+
+```text
+CopyLineData:
+  Game Thread 将巨大的 LineData TArray 完整复制一份给 render command。
+
+UploadLineData:
+  Render Thread 将这份 LineData 创建/上传成 GPU StructuredBuffer。
+```
+
+其中 `CopyLineData` 是纯 CPU 侧重复拷贝，应该优先消掉；`UploadLineData` 是每帧真实上传大 buffer，仍会保留，后续需要更深层的数据布局或 GPU 缓存方案优化。
+
+**修改点：**
+
+- `IComputerShaderObj.h`
+  - `LineData` 从单个 `TArray<FCurveSegmentGPU>` 改为三份 `TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>` 缓冲。
+  - 新增 `FRenderCommandFence LineDataUploadFences[3]`，避免 Game Thread 写入仍被 Render Thread 使用的缓冲。
+  - 新增 `LineDataWriteBufferIndex`、`LineDataReadyBufferIndex`、`bHasPendingLineDataUpload`，跟踪当前写入缓冲和待上传缓冲。
+
+- `IComputerShaderObj.cpp`
+  - 新增 `GetWritableLineDataBuffer()`：选择一个当前可写的 `LineData` 缓冲；如果三缓冲都被占用，则在 `ProcessCurveData.WaitForLineDataUploadBuffer` 中等待 fence。
+  - 新增 `MarkLineDataReadyForUpload()`：`ProcessCurveData` 完成后标记本帧 `LineData` 可上传。
+  - `ProcessCurveData` / `CreateRenderTarget` 写入 `GetWritableLineDataBuffer()` 返回的缓冲，而不是写入单个成员 `LineData`。
+  - `UploadProcessedCurveDataToGPU` 不再执行 `TArray<FCurveSegmentGPU> LineDataCopy = LineData`。
+  - render command lambda 捕获 `TSharedPtr`，只复制智能指针控制信息，不复制大数组内容。
+  - render command 入队后对对应缓冲调用 `BeginFence()`，用于判断该缓冲何时可重新写入。
+
+**优化前：**
+
+```cpp
+TArray<FCurveSegmentGPU> LineDataCopy = LineData;
+
+ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
+    [LineDataCopy = MoveTemp(LineDataCopy)](...)
+    {
+        CreateStructuredBuffer(..., LineDataCopy.GetData(), ...);
+    }
+);
+```
+
+问题是 `LineDataCopy = LineData` 会完整复制所有线段。数据量越大，Game Thread 越容易被这一步拖住。
+
+**优化后：**
+
+```cpp
+TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
+LineDataUploadBuffer = LineDataBuffers[LineDataReadyBufferIndex];
+
+ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
+    [LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer)](...)
+    {
+        const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
+        CreateStructuredBuffer(..., LineDataUpload.GetData(), ...);
+    }
+);
+```
+
+render command 持有 shared pointer，所以 Game Thread 可以继续写另一份缓冲，不需要为 lambda 再复制一份巨大的 `TArray`。
+
+**三缓冲时序：**
+
+```text
+Frame N:
+  ProcessCurveData 写 Buffer A
+  Upload 入队，Render Thread 读取 Buffer A，BeginFence(A)
+
+Frame N+1:
+  ProcessCurveData 写 Buffer B
+  Upload 入队，Render Thread 读取 Buffer B，BeginFence(B)
+
+Frame N+2:
+  ProcessCurveData 写 Buffer C
+  Upload 入队，Render Thread 读取 Buffer C，BeginFence(C)
+
+Frame N+3:
+  优先复用已经 fence complete 的 Buffer A
+```
+
+如果 Render Thread 跟不上，三份缓冲都还没释放，`GetWritableLineDataBuffer()` 会等待某个 fence，并在 Insights 中显示：
+
+```text
+UIComputerShaderObj::ProcessCurveData.WaitForLineDataUploadBuffer
+```
+
+这个事件如果明显变长，说明瓶颈已经从“Game Thread 复制大数组”转移到“Render Thread/GPU 上传节奏跟不上”。
+
+**预期收益：**
+
+- `UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyLineData` 应消失。
+- Game Thread 少一次完整 `LineData` 大拷贝。
+- 大数组容量可在三份缓冲中复用，减少每帧分配和释放压力。
+- `UploadLineData` 仍然存在，因为数据仍需每帧上传到 GPU。
+
+**限制：**
+
+这个优化只解决 CPU 侧重复拷贝，不解决每帧上传数据体积本身。如果 `UploadLineData` 仍然很高，需要继续做下面的结构性优化。
+
+**后续优化方向：**
+
+1. **GPU 持久 buffer**
+   - 将 `LineData` 上传到持久 GPU buffer。
+   - 数据变化时用更新/拷贝路径刷新，而不是每帧创建新的 RDG structured buffer。
+   - 适合数据大但更新频率或更新范围可控的情况。
+
+2. **上传原始数据，让 GPU 做分桶**
+   - CPU 每帧只上传原始 `float` 样本。
+   - GPU pass 1 做 min/max、M4 采样、bucket 构建。
+   - GPU pass 2 绘制到 RenderTarget。
+   - 适合原始数据比展开后的 `FCurveSegmentGPU` 小很多的情况。
+
+3. **滚动窗口 / ring buffer 增量上传**
+   - 如果曲线是示波器式滚动数据，每帧只新增少量 sample。
+   - GPU 侧保存固定长度环形 buffer。
+   - 每帧只上传新增 sample 和 `HeadIndex`。
+   - 适合定长数组持续滚动更新的场景，收益通常最大。
+
+4. **压缩上传格式**
+   - 将 y 值量化为 `uint16` / `half`。
+   - 或将线段端点改成局部坐标/短整型。
+   - 适合视觉精度允许少量量化误差的 UI 曲线。
+
+---
+
 ## 三、不变项
 
 以下流水线或数据路径未做修改，不影响功能：
@@ -136,7 +272,7 @@ Padding 保证 32B 对齐（GPU 缓存行友好），同时让结构化 buffer �
 |------|------|
 | `SimpleComputeShader.usf` / `CustomComputeShader.cpp` | 独立流水线，未触及 |
 | `LineDrawDesc` / `BucketRanges` / `CurveColors` 的上传方式 | 仍使用 `CreateUploadBuffer`，与 shader 端 `Buffer<>` 声明匹配 |
-| CPU 端 M4 采样 + x-bucket 分桶逻辑 | `AddCurveToBuckets` / `AddPointUnique` 等核心算法不变 |
+| CPU 端 M4 采样 + x-bucket 分桶逻辑 | `AddCurveToBuckets` / `AddPointUnique` 等核心算法不变；只是最终写入可复用的三缓冲 `LineData` |
 | `FIComputerCurveRenderConfig` 结构体 | API 签名不变 |
 | 线程组总数 | `ThreadGroupSizeX × ThreadGroupSizeY = 64` 不变，一个组仍处理 64 个像素 |
 | `GBinningExpand = 2.0` | AA 安全余量不变 |
@@ -152,3 +288,6 @@ Padding 保证 32B 对齐（GPU 缓存行友好），同时让结构化 buffer �
 - [ ] 运行时不再崩溃（无除零/无 SRV 创建失败）
 - [ ] 渲染结果与修改前视觉一致
 - [ ] 性能对比（RenderDoc / PIX / UE GPU Profiler）
+- [ ] Unreal Insights 中 `CopyLineData` 消失或接近 0
+- [ ] Unreal Insights 中观察 `ProcessCurveData.WaitForLineDataUploadBuffer`，确认三缓冲没有频繁等待
+- [ ] Unreal Insights 中继续观察 `UploadLineData`，判断是否需要进入 GPU 持久 buffer / 原始数据上传 / ring buffer 方案

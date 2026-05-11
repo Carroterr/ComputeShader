@@ -389,7 +389,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	int32 Height = 0;
 
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.GetRenderTargetResource");
 		RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
 		Width = RenderTarget->SizeX;
 		Height = RenderTarget->SizeY;
@@ -398,7 +397,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
 	int32 LineDataUploadBufferIndex = INDEX_NONE;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.UseLineDataBuffer");
 		if (!bHasPendingLineDataUpload || LineDataReadyBufferIndex == INDEX_NONE ||
 			!LineDataBuffers[LineDataReadyBufferIndex].IsValid())
 		{
@@ -418,7 +416,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	TArray<float> LineDrawDescCopy;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyLineDrawDesc");
 		LineDrawDescCopy = LineDrawDesc;
 		if (LineDrawDescCopy.Num() != GLineDrawDescFloatCount)
 		{
