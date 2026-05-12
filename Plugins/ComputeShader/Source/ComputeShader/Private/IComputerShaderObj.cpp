@@ -658,11 +658,6 @@ void AIComputerShaderObj::RequestWorkerCurveProcess(int32 Width, int32 Height)
 		return;
 	}
 
-	if (!CurveProcessWorker)
-	{
-		CurveProcessWorker = new FComputerCurveProcessWorker();
-	}
-
 	TArray<TArray<float>> ValuesSnapshot = SimulatedCurveValues;
 	FIComputerCurveRenderConfig ConfigSnapshot = RenderConfig;
 	const int32 Generation = ++CurveProcessGeneration;
@@ -714,9 +709,21 @@ void AIComputerShaderObj::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (bUploadEveryTick)
+	if (bAutoUploadToGPU)
 	{
-		UploadProcessedCurveDataToGPU();
+		const float SafeFrequencyHz = FMath::Max(0.1f, UploadFrequencyHz);
+		const float UploadIntervalSeconds = 1.0f / SafeFrequencyHz;
+		UploadTickAccumulatorSeconds += DeltaSeconds;
+
+		if (UploadTickAccumulatorSeconds >= UploadIntervalSeconds)
+		{
+			UploadTickAccumulatorSeconds = FMath::Fmod(UploadTickAccumulatorSeconds, UploadIntervalSeconds);
+			UploadProcessedCurveDataToGPU();
+		}
+	}
+	else
+	{
+		UploadTickAccumulatorSeconds = 0.0f;
 	}
 }
 

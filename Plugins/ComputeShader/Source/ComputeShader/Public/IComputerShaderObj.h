@@ -86,7 +86,6 @@ public:
 	bool ProcessCurveData(const TArray<TArray<float>>& Values);
 
 	// 将 ProcessCurveData 生成的最终结果上传到 GPU，并执行 compute shader。
-	UFUNCTION(BlueprintCallable)
 	void UploadProcessedCurveDataToGPU();
 
 	UFUNCTION(BlueprintCallable)
@@ -113,8 +112,11 @@ private:
 	FIComputerCurveRenderConfig RenderConfig;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Tick", meta = (AllowPrivateAccess = "true"))
-	bool bUploadEveryTick = true;
+	bool bAutoUploadToGPU = true;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Tick", meta = (AllowPrivateAccess = "true", ClampMin = "0.1"))
+	float UploadFrequencyHz = 30.0f;
+	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|RenderTarget", meta = (AllowPrivateAccess = "true", ClampMin = "1"))
 	int32 RenderTargetWidth = 1024;
 
@@ -133,6 +135,7 @@ private:
 	FComputerCurveProcessWorker* CurveProcessWorker = nullptr;
 	int32 CurveProcessGeneration = 0;
 	int32 LastAppliedCurveProcessGeneration = 0;
+	float UploadTickAccumulatorSeconds = 0.0f;
 	bool bCurveProcessRequestPending = false;
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataBuffers[LineDataUploadBufferCount];
 	FRenderCommandFence LineDataUploadFences[LineDataUploadBufferCount];
