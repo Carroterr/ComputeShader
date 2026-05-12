@@ -1,7 +1,13 @@
-#include "IComputerShaderObj.h"
+﻿#include "IComputerShaderObj.h"
 
 #include "IComputerShader.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "HAL/CriticalSection.h"
+#include "HAL/Event.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/Runnable.h"
+#include "HAL/RunnableThread.h"
+#include "HAL/ThreadSafeBool.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "RenderGraphUtils.h"
 
@@ -29,6 +35,13 @@ namespace
 		float X1 = 0.0f;
 		float Y1 = 0.0f;
 		uint32 CurveIndex = 0;
+	};
+
+	struct FBinnedCurveSegment
+	{
+		FCurveSegment Segment;
+		int32 StartBucket = 0;
+		int32 EndBucket = 0;
 	};
 
 	// Returns a fallback color when the user did not configure one for this curve.
@@ -95,25 +108,20 @@ namespace
 		BuildCurveColors(Config, OutCurveColors);
 	}
 
-	// Maps a raw sample index into screen-space x so the shader only sees draw-ready line segments.
-	float SourceIndexToScreenX(int32 SourceIndex, int32 SourceCount, int32 Width)
-	{
-		if (Width <= 1 || SourceCount <= 1)
-		{
-			return 0.5f;
-		}
-
-		return static_cast<float>(SourceIndex) * static_cast<float>(Width - 1) / static_cast<float>(SourceCount - 1) +
-			0.5f;
-	}
-
 	// M4 can select the same source point more than once, so keep only one point per source index.
-	void AddPointUnique(TArray<FReducedWavePoint>& Points, const FReducedWavePoint& Point)
+	void AddPointUniqueSorted(TArray<FReducedWavePoint, TInlineAllocator<4>>& Points, const FReducedWavePoint& Point)
 	{
-		for (const FReducedWavePoint& ExistingPoint : Points)
+		for (int32 PointIndex = 0; PointIndex < Points.Num(); ++PointIndex)
 		{
+			const FReducedWavePoint& ExistingPoint = Points[PointIndex];
 			if (ExistingPoint.SourceIndex == Point.SourceIndex)
 			{
+				return;
+			}
+
+			if (Point.SourceIndex < ExistingPoint.SourceIndex)
+			{
+				Points.Insert(Point, PointIndex);
 				return;
 			}
 		}
@@ -121,9 +129,9 @@ namespace
 		Points.Add(Point);
 	}
 
-	// Duplicates a segment into every x bucket it can affect, including a small AA expansion.
-	void AddSegmentToBuckets(TArray<TArray<FCurveSegment>>& BucketSegments, int32 Width, uint32 CurveIndex,
-	                         const FReducedWavePoint& Start, const FReducedWavePoint& End)
+	// Records a segment and the x bucket range it can affect, including a small AA expansion.
+	void AddSegmentToBins(TArray<FBinnedCurveSegment>& BinnedSegments, TArray<int32>& BucketCounts, int32 Width,
+	                      uint32 CurveIndex, const FReducedWavePoint& Start, const FReducedWavePoint& End)
 	{
 		if (Start.SourceIndex == End.SourceIndex || Width <= 0)
 		{
@@ -138,26 +146,31 @@ namespace
 		const FCurveSegment Segment{Start.X, Start.Y, End.X, End.Y, CurveIndex};
 		for (int32 BucketIndex = StartBucket; BucketIndex <= EndBucket; ++BucketIndex)
 		{
-			BucketSegments[BucketIndex].Add(Segment);
+			++BucketCounts[BucketIndex];
 		}
+
+		BinnedSegments.Add(FBinnedCurveSegment{Segment, StartBucket, EndBucket});
 	}
 
 	// Reduces one curve with M4 sampling and emits screen-space segments into x buckets.
 	template <typename SampleFuncType>
-	void AddCurveToBuckets(int32 CurveIndex, int32 SampleCount, int32 Width, float BaseLine, float ValueScale,
-	                       SampleFuncType GetSample, TArray<TArray<FCurveSegment>>& BucketSegments)
+	void AddCurveToBins(int32 CurveIndex, int32 SampleCount, int32 Width, float BaseLine, float ValueScale,
+	                    SampleFuncType GetSample, TArray<FBinnedCurveSegment>& BinnedSegments,
+	                    TArray<int32>& BucketCounts)
 	{
 		if (SampleCount < 2 || Width <= 0)
 		{
 			return;
 		}
 
-		auto MakePoint = [SampleCount, Width, BaseLine, ValueScale, &GetSample](int32 SourceIndex)
+		const float SourceToScreenScale = Width > 1
+			                                  ? static_cast<float>(Width - 1) / static_cast<float>(SampleCount - 1)
+			                                  : 0.0f;
+		auto MakePoint = [SourceToScreenScale, BaseLine, ValueScale](int32 SourceIndex, float SampleValue)
 		{
-			const float SampleValue = GetSample(SourceIndex);
 			return FReducedWavePoint{
 				SourceIndex,
-				SourceIndexToScreenX(SourceIndex, SampleCount, Width),
+				static_cast<float>(SourceIndex) * SourceToScreenScale + 0.5f,
 				BaseLine + SampleValue * ValueScale + 0.5f
 			};
 		};
@@ -167,21 +180,30 @@ namespace
 
 		for (int32 BucketIndex = 0; BucketIndex < Width; ++BucketIndex)
 		{
-			const int32 BucketStart = FMath::FloorToInt(static_cast<float>(BucketIndex) * SampleCount / Width);
+			const int32 BucketStart = static_cast<int32>(
+				static_cast<int64>(BucketIndex) * static_cast<int64>(SampleCount) / static_cast<int64>(Width));
 			const int32 BucketEnd = FMath::Max(
 				BucketStart + 1,
-				FMath::FloorToInt(static_cast<float>(BucketIndex + 1) * SampleCount / Width)
+				static_cast<int32>(
+					static_cast<int64>(BucketIndex + 1) * static_cast<int64>(SampleCount) / static_cast<int64>(Width))
 			);
 			const int32 BucketLast = FMath::Min(BucketEnd - 1, SampleCount - 1);
 
 			int32 MinIndex = BucketStart;
 			int32 MaxIndex = BucketStart;
-			float MinValue = GetSample(BucketStart);
-			float MaxValue = MinValue;
+			const float StartValue = GetSample(BucketStart);
+			float LastValue = StartValue;
+			float MinValue = StartValue;
+			float MaxValue = StartValue;
 
 			for (int32 SourceIndex = BucketStart + 1; SourceIndex < BucketEnd; ++SourceIndex)
 			{
 				const float Value = GetSample(SourceIndex);
+				if (SourceIndex == BucketLast)
+				{
+					LastValue = Value;
+				}
+
 				if (Value < MinValue)
 				{
 					MinValue = Value;
@@ -195,17 +217,11 @@ namespace
 				}
 			}
 
-			TArray<FReducedWavePoint> BucketPoints;
-			BucketPoints.Reserve(4);
-			AddPointUnique(BucketPoints, MakePoint(BucketStart));
-			AddPointUnique(BucketPoints, MakePoint(MinIndex));
-			AddPointUnique(BucketPoints, MakePoint(MaxIndex));
-			AddPointUnique(BucketPoints, MakePoint(BucketLast));
-
-			BucketPoints.Sort([](const FReducedWavePoint& Left, const FReducedWavePoint& Right)
-			{
-				return Left.SourceIndex < Right.SourceIndex;
-			});
+			TArray<FReducedWavePoint, TInlineAllocator<4>> BucketPoints;
+			AddPointUniqueSorted(BucketPoints, MakePoint(BucketStart, StartValue));
+			AddPointUniqueSorted(BucketPoints, MakePoint(MinIndex, MinValue));
+			AddPointUniqueSorted(BucketPoints, MakePoint(MaxIndex, MaxValue));
+			AddPointUniqueSorted(BucketPoints, MakePoint(BucketLast, LastValue));
 
 			if (BucketPoints.Num() == 0)
 			{
@@ -214,14 +230,14 @@ namespace
 
 			if (bHasPreviousPoint)
 			{
-				AddSegmentToBuckets(BucketSegments, Width, static_cast<uint32>(CurveIndex), PreviousPoint,
-				                    BucketPoints[0]);
+				AddSegmentToBins(BinnedSegments, BucketCounts, Width, static_cast<uint32>(CurveIndex), PreviousPoint,
+				                 BucketPoints[0]);
 			}
 
 			for (int32 PointIndex = 0; PointIndex + 1 < BucketPoints.Num(); ++PointIndex)
 			{
-				AddSegmentToBuckets(BucketSegments, Width, static_cast<uint32>(CurveIndex), BucketPoints[PointIndex],
-				                    BucketPoints[PointIndex + 1]);
+				AddSegmentToBins(BinnedSegments, BucketCounts, Width, static_cast<uint32>(CurveIndex),
+				                 BucketPoints[PointIndex], BucketPoints[PointIndex + 1]);
 			}
 
 			PreviousPoint = BucketPoints.Last();
@@ -229,31 +245,45 @@ namespace
 		}
 	}
 
-	// Flattens per-column buckets into GPU buffers: LineData (struct per segment) plus BucketRanges offset/count pairs.
-	void FlattenBuckets(const TArray<TArray<FCurveSegment>>& BucketSegments, TArray<uint32>& OutBucketRanges,
-	                    TArray<FCurveSegmentGPU>& OutLineData)
+	// Builds final GPU buffers directly from binned segments.
+	// BucketRanges[x * 2 + 0/1] records each column's offset/count in OutLineData.
+	void BuildBucketRangesAndLineData(const TArray<FBinnedCurveSegment>& BinnedSegments,
+	                                  const TArray<int32>& BucketCounts, TArray<uint32>& OutBucketRanges,
+	                                  TArray<FCurveSegmentGPU>& OutLineData)
 	{
-		const int32 Width = BucketSegments.Num();
+		const int32 Width = BucketCounts.Num();
 		int32 TotalSegmentCount = 0;
-		for (const TArray<FCurveSegment>& Bucket : BucketSegments)
-		{
-			TotalSegmentCount += Bucket.Num();
-		}
 
-		OutBucketRanges.SetNumZeroed(Width * GBucketRangeUintCount);
-		OutLineData.Reset(FMath::Max(1, TotalSegmentCount));
+		OutBucketRanges.SetNumUninitialized(Width * GBucketRangeUintCount);
+		TArray<uint32> BucketWriteOffsets;
+		BucketWriteOffsets.SetNumUninitialized(Width);
 
 		for (int32 BucketIndex = 0; BucketIndex < Width; ++BucketIndex)
 		{
-			const TArray<FCurveSegment>& Bucket = BucketSegments[BucketIndex];
-			const uint32 SegmentOffset = static_cast<uint32>(OutLineData.Num());
+			const uint32 SegmentOffset = static_cast<uint32>(TotalSegmentCount);
+			const int32 BucketSegmentCount = BucketCounts[BucketIndex];
 
 			OutBucketRanges[BucketIndex * GBucketRangeUintCount] = SegmentOffset;
-			OutBucketRanges[BucketIndex * GBucketRangeUintCount + 1] = static_cast<uint32>(Bucket.Num());
+			OutBucketRanges[BucketIndex * GBucketRangeUintCount + 1] = static_cast<uint32>(BucketSegmentCount);
+			BucketWriteOffsets[BucketIndex] = SegmentOffset;
+			TotalSegmentCount += BucketSegmentCount;
+		}
 
-			for (const FCurveSegment& Segment : Bucket)
+		if (TotalSegmentCount == 0)
+		{
+			OutLineData.Reset(1);
+			OutLineData.AddZeroed(1);
+			return;
+		}
+
+		OutLineData.SetNumUninitialized(TotalSegmentCount);
+
+		for (const FBinnedCurveSegment& BinnedSegment : BinnedSegments)
+		{
+			const FCurveSegment& Segment = BinnedSegment.Segment;
+			for (int32 BucketIndex = BinnedSegment.StartBucket; BucketIndex <= BinnedSegment.EndBucket; ++BucketIndex)
 			{
-				FCurveSegmentGPU& Out = OutLineData.AddDefaulted_GetRef();
+				FCurveSegmentGPU& Out = OutLineData[BucketWriteOffsets[BucketIndex]++];
 				Out.X0 = Segment.X0;
 				Out.Y0 = Segment.Y0;
 				Out.X1 = Segment.X1;
@@ -264,11 +294,88 @@ namespace
 				Out._Pad2 = 0;
 			}
 		}
+	}
 
-		if (OutLineData.Num() == 0)
+	FIComputerProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
+	                                                    const FIComputerCurveRenderConfig& RenderConfig,
+	                                                    int32 Width, int32 Height, int32 Generation)
+	{
+		FIComputerProcessedCurveData ProcessedData;
+		ProcessedData.Generation = Generation;
+		ProcessedData.Width = Width;
+		ProcessedData.Height = Height;
+
+		const int32 CurveCount = Values.Num();
+		const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
+
+		if (CurveCount <= 0)
 		{
-			OutLineData.AddZeroed(1);
+			FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+			ConfigForFrame.CurveCount = 1;
+			ResetCurveBuffers(Width, Height, ConfigForFrame, ProcessedData.LineDrawDesc, ProcessedData.LineData,
+			                  ProcessedData.BucketRanges, ProcessedData.CurveColors);
+			return ProcessedData;
 		}
+
+		for (const TArray<float>& CurveSamples : Values)
+		{
+			if (CurveSamples.Num() < SampleCount)
+			{
+				FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+				ConfigForFrame.CurveCount = CurveCount;
+				ResetCurveBuffers(Width, Height, ConfigForFrame, ProcessedData.LineDrawDesc, ProcessedData.LineData,
+				                  ProcessedData.BucketRanges, ProcessedData.CurveColors);
+				return ProcessedData;
+			}
+		}
+
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData");
+
+		const int32 SafeCurveCount = FMath::Max(1, CurveCount);
+		const int32 SafeSampleCount = FMath::Max(2, SampleCount);
+
+		FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+		ConfigForFrame.CurveCount = SafeCurveCount;
+		ConfigForFrame.SampleCount = SafeSampleCount;
+
+		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
+		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
+
+		TArray<FBinnedCurveSegment> BinnedSegments;
+		TArray<int32> BucketCounts;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.InitBuckets");
+			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
+			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
+			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildBuckets");
+			for (int32 CurveIndex = 0; CurveIndex < SafeCurveCount; ++CurveIndex)
+			{
+				const float BaseLine = ConfigForFrame.BaseLineStart +
+					static_cast<float>(CurveIndex) * ConfigForFrame.BaseLineStep;
+
+				const TArray<float>& CurveSamples = Values[CurveIndex];
+				auto GetCurveSample = [&CurveSamples](int32 SourceIndex)
+				{
+					return CurveSamples[SourceIndex];
+				};
+
+				AddCurveToBins(CurveIndex, SafeSampleCount, Width, BaseLine, ConfigForFrame.ValueScale,
+				               GetCurveSample, BinnedSegments, BucketCounts);
+			}
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildGPUData");
+			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, ProcessedData.BucketRanges,
+			                             ProcessedData.LineData);
+		}
+
+		ProcessedData.bAcceptedInput = true;
+		return ProcessedData;
 	}
 
 	// Legacy SetSinWaveData defaults: one 5000-sample curve, caller-provided baseline, default color.
@@ -285,7 +392,145 @@ namespace
 	}
 }
 
-TArray<FCurveSegmentGPU>& UIComputerShaderObj::GetWritableLineDataBuffer()
+class FComputerCurveProcessWorker final : public FRunnable
+{
+public:
+	FComputerCurveProcessWorker()
+	{
+		WorkEvent = FPlatformProcess::GetSynchEventFromPool(false);
+		Thread = FRunnableThread::Create(this, TEXT("IComputerShader_CurveProcessWorker"), 0, TPri_BelowNormal);
+	}
+
+	virtual ~FComputerCurveProcessWorker() override
+	{
+		Shutdown();
+	}
+
+	virtual uint32 Run() override
+	{
+		while (!bStopRequested)
+		{
+			WorkEvent->Wait();
+
+			while (!bStopRequested)
+			{
+				FRequest Request;
+				{
+					FScopeLock Lock(&RequestCriticalSection);
+					if (!bHasPendingRequest)
+					{
+						break;
+					}
+
+					Request = MoveTemp(PendingRequest);
+					bHasPendingRequest = false;
+				}
+
+				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
+					Request.Values,
+					Request.Config,
+					Request.Width,
+					Request.Height,
+					Request.Generation
+				);
+
+				{
+					FScopeLock Lock(&ResultCriticalSection);
+					CompletedResult = MoveTemp(Result);
+					bHasCompletedResult = true;
+				}
+			}
+		}
+
+		return 0;
+	}
+
+	virtual void Stop() override
+	{
+		bStopRequested = true;
+		if (WorkEvent)
+		{
+			WorkEvent->Trigger();
+		}
+	}
+
+	void Enqueue(TArray<TArray<float>>&& Values, const FIComputerCurveRenderConfig& Config, int32 Width, int32 Height,
+	             int32 Generation)
+	{
+		{
+			FScopeLock Lock(&RequestCriticalSection);
+			PendingRequest.Values = MoveTemp(Values);
+			PendingRequest.Config = Config;
+			PendingRequest.Width = Width;
+			PendingRequest.Height = Height;
+			PendingRequest.Generation = Generation;
+			bHasPendingRequest = true;
+		}
+
+		WorkEvent->Trigger();
+	}
+
+	bool DequeueResult(FIComputerProcessedCurveData& OutResult)
+	{
+		FScopeLock Lock(&ResultCriticalSection);
+		if (!bHasCompletedResult)
+		{
+			return false;
+		}
+
+		OutResult = MoveTemp(CompletedResult);
+		bHasCompletedResult = false;
+		return true;
+	}
+
+	void Shutdown()
+	{
+		Stop();
+
+		if (Thread)
+		{
+			Thread->WaitForCompletion();
+			delete Thread;
+			Thread = nullptr;
+		}
+
+		if (WorkEvent)
+		{
+			FPlatformProcess::ReturnSynchEventToPool(WorkEvent);
+			WorkEvent = nullptr;
+		}
+	}
+
+private:
+	struct FRequest
+	{
+		TArray<TArray<float>> Values;
+		FIComputerCurveRenderConfig Config;
+		int32 Width = 0;
+		int32 Height = 0;
+		int32 Generation = 0;
+	};
+
+	FRunnableThread* Thread = nullptr;
+	FEvent* WorkEvent = nullptr;
+	FThreadSafeBool bStopRequested = false;
+
+	FCriticalSection RequestCriticalSection;
+	FRequest PendingRequest;
+	bool bHasPendingRequest = false;
+
+	FCriticalSection ResultCriticalSection;
+	FIComputerProcessedCurveData CompletedResult;
+	bool bHasCompletedResult = false;
+};
+
+AIComputerShaderObj::AIComputerShaderObj()
+{
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = true;
+}
+
+TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 {
 	auto EnsureBuffer = [](TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>& Buffer)
 		-> TArray<FCurveSegmentGPU>&
@@ -334,7 +579,7 @@ TArray<FCurveSegmentGPU>& UIComputerShaderObj::GetWritableLineDataBuffer()
 		}
 
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.WaitForLineDataUploadBuffer");
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.WaitForLineDataUploadBuffer");
 			LineDataUploadFences[WaitBufferIndex].Wait();
 		}
 
@@ -344,40 +589,173 @@ TArray<FCurveSegmentGPU>& UIComputerShaderObj::GetWritableLineDataBuffer()
 	return EnsureBuffer(LineDataBuffers[LineDataWriteBufferIndex]);
 }
 
-void UIComputerShaderObj::MarkLineDataReadyForUpload()
+void AIComputerShaderObj::MarkLineDataReadyForUpload()
 {
 	bHasPendingLineDataUpload = true;
 	LineDataReadyBufferIndex = LineDataWriteBufferIndex;
 	LineDataWriteBufferIndex = (LineDataWriteBufferIndex + 1) % LineDataUploadBufferCount;
 }
 
-void UIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
+void AIComputerShaderObj::ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount)
 {
-	RenderTarget = NewObject<UTextureRenderTarget2D>(this);
+	FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+	ConfigForFrame.CurveCount = FMath::Max(1, CurveCount);
 
-	RenderTarget->bCanCreateUAV = true;
-	RenderTarget->InitCustomFormat(Width, Height, PF_FloatRGBA, false);
-	RenderTarget->UpdateResourceImmediate(true);
-
-	FIComputerCurveRenderConfig DefaultConfig;
 	TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
-	ResetCurveBuffers(Width, Height, DefaultConfig, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
+	ResetCurveBuffers(Width, Height, ConfigForFrame, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
 	MarkLineDataReadyForUpload();
 }
 
-UTextureRenderTarget2D* UIComputerShaderObj::GetRenderTarget() const
+void AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData)
+{
+	LineDrawDesc = MoveTemp(ProcessedData.LineDrawDesc);
+	BucketRanges = MoveTemp(ProcessedData.BucketRanges);
+	CurveColors = MoveTemp(ProcessedData.CurveColors);
+
+	TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
+	WritableLineData = MoveTemp(ProcessedData.LineData);
+	if (WritableLineData.Num() == 0)
+	{
+		WritableLineData.AddZeroed(1);
+	}
+
+	LastAppliedCurveProcessGeneration = FMath::Max(LastAppliedCurveProcessGeneration, ProcessedData.Generation);
+	MarkLineDataReadyForUpload();
+}
+
+bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 Height)
+{
+	if (!CurveProcessWorker)
+	{
+		return false;
+	}
+
+	FIComputerProcessedCurveData ProcessedData;
+	if (!CurveProcessWorker->DequeueResult(ProcessedData))
+	{
+		return false;
+	}
+
+	if (ProcessedData.Generation <= LastAppliedCurveProcessGeneration)
+	{
+		return false;
+	}
+
+	if (ProcessedData.Width != Width || ProcessedData.Height != Height)
+	{
+		bCurveProcessRequestPending = true;
+		return false;
+	}
+
+	ApplyProcessedCurveData(MoveTemp(ProcessedData));
+	return true;
+}
+
+void AIComputerShaderObj::RequestWorkerCurveProcess(int32 Width, int32 Height)
+{
+	if (!bCurveProcessRequestPending)
+	{
+		return;
+	}
+
+	if (!CurveProcessWorker)
+	{
+		CurveProcessWorker = new FComputerCurveProcessWorker();
+	}
+
+	TArray<TArray<float>> ValuesSnapshot = SimulatedCurveValues;
+	FIComputerCurveRenderConfig ConfigSnapshot = RenderConfig;
+	const int32 Generation = ++CurveProcessGeneration;
+	bCurveProcessRequestPending = false;
+
+	CurveProcessWorker->Enqueue(MoveTemp(ValuesSnapshot), ConfigSnapshot, Width, Height, Generation);
+}
+
+void AIComputerShaderObj::ShutdownCurveProcessWorker()
+{
+	if (CurveProcessWorker)
+	{
+		delete CurveProcessWorker;
+		CurveProcessWorker = nullptr;
+	}
+}
+
+void AIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
+{
+	RenderTargetWidth = FMath::Max(1, Width);
+	RenderTargetHeight = FMath::Max(1, Height);
+
+	RenderTarget = NewObject<UTextureRenderTarget2D>(this);
+
+	RenderTarget->bCanCreateUAV = true;
+	RenderTarget->InitCustomFormat(RenderTargetWidth, RenderTargetHeight, PF_FloatRGBA, false);
+	RenderTarget->UpdateResourceImmediate(true);
+
+	ResetCurveDataToSafeBuffers(RenderTargetWidth, RenderTargetHeight, RenderConfig.CurveCount);
+	bCurveProcessRequestPending = true;
+}
+
+void AIComputerShaderObj::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (!CurveProcessWorker)
+	{
+		CurveProcessWorker = new FComputerCurveProcessWorker();
+	}
+
+	if (bCreateRenderTargetOnBeginPlay && !RenderTarget)
+	{
+		CreateRenderTarget(RenderTargetWidth, RenderTargetHeight);
+	}
+}
+
+void AIComputerShaderObj::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	if (bUploadEveryTick)
+	{
+		UploadProcessedCurveDataToGPU();
+	}
+}
+
+void AIComputerShaderObj::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	ShutdownCurveProcessWorker();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AIComputerShaderObj::BeginDestroy()
+{
+	ShutdownCurveProcessWorker();
+	Super::BeginDestroy();
+}
+
+UTextureRenderTarget2D* AIComputerShaderObj::GetRenderTarget() const
 {
 	return RenderTarget;
 }
 
-void UIComputerShaderObj::Execute()
+void AIComputerShaderObj::Execute()
 {
 	UploadProcessedCurveDataToGPU();
 }
 
-void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
+void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU");
+	RenderConfig = InConfig;
+	bCurveProcessRequestPending = true;
+}
+
+FIComputerCurveRenderConfig AIComputerShaderObj::GetRenderConfig() const
+{
+	return RenderConfig;
+}
+
+void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU");
 
 	if (!RenderTarget)
 	{
@@ -393,6 +771,10 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 		Width = RenderTarget->SizeX;
 		Height = RenderTarget->SizeY;
 	}
+
+	bCurveProcessRequestPending = true;
+	TryApplyWorkerCurveProcessResult(Width, Height);
+	RequestWorkerCurveProcess(Width, Height);
 
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
 	int32 LineDataUploadBufferIndex = INDEX_NONE;
@@ -419,8 +801,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 		LineDrawDescCopy = LineDrawDesc;
 		if (LineDrawDescCopy.Num() != GLineDrawDescFloatCount)
 		{
-			FIComputerCurveRenderConfig DefaultConfig;
-			UpdateLineDrawDesc(LineDrawDescCopy, Width, Height, DefaultConfig.CurveCount);
+			UpdateLineDrawDesc(LineDrawDescCopy, Width, Height, RenderConfig.CurveCount);
 		}
 		LineDrawDescCopy[0] = static_cast<float>(Width);
 		LineDrawDescCopy[1] = static_cast<float>(Height);
@@ -429,7 +810,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	TArray<uint32> BucketRangesCopy;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyBucketRanges");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyBucketRanges");
 		BucketRangesCopy = BucketRanges;
 		const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * GBucketRangeUintCount;
 		if (BucketRangesCopy.Num() != ExpectedBucketRangeCount)
@@ -440,7 +821,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	TArray<FLinearColor> CurveColorsCopy;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyCurveColors");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyCurveColors");
 		CurveColorsCopy = CurveColors;
 		if (CurveColorsCopy.Num() == 0)
 		{
@@ -451,7 +832,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	// Stage 2: copy processed CPU buffers to the render thread, upload them with RDG, then dispatch.
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU.EnqueueRenderCommand");
 		ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
 			[RenderTargetResource, Width, Height, LineDrawDescCopy = MoveTemp(LineDrawDescCopy),
 					LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
@@ -459,7 +839,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 					CurveColorsCopy = MoveTemp(CurveColorsCopy)](
 				FRHICommandListImmediate& RHICmdList)
 			{
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread");
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread");
 
 				FRDGBuilder GraphBuilder(RHICmdList);
 
@@ -467,12 +847,10 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 				FIComputerShader::FParameters* PassParameters = nullptr;
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.AllocParameters");
 					PassParameters = GraphBuilder.AllocParameters<FIComputerShader::FParameters>();
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.RegisterTarget");
 					FRDGTextureRef TargetTexture = RegisterExternalTexture(
 						GraphBuilder,
 						RenderTargetResource->GetRenderTargetTexture(),
@@ -481,9 +859,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 					PassParameters->RenderTarget = GraphBuilder.CreateUAV(TargetTexture);
 				}
-
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineDrawDesc");
 					FRDGBufferRef LineDrawDescBuffer = CreateUploadBuffer(GraphBuilder, TEXT("LineDrawDescBuffer"),
 					                                                      sizeof(float), LineDrawDescCopy.Num(),
 					                                                      LineDrawDescCopy.GetData(),
@@ -493,7 +869,7 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
 					const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
 					FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
 					                                                      sizeof(FCurveSegmentGPU), LineDataUpload.Num(),
@@ -503,7 +879,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadBucketRanges");
 					FRDGBufferRef BucketRangesBuffer = CreateUploadBuffer(GraphBuilder, TEXT("BucketRangesBuffer"),
 					                                                      sizeof(uint32), BucketRangesCopy.Num(),
 					                                                      BucketRangesCopy.GetData(),
@@ -513,7 +888,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadCurveColors");
 					FRDGBufferRef CurveColorsBuffer = CreateUploadBuffer(GraphBuilder, TEXT("CurveColorsBuffer"),
 					                                                     sizeof(FLinearColor), CurveColorsCopy.Num(),
 					                                                     CurveColorsCopy.GetData(),
@@ -524,7 +898,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 				FIntVector GroupCount(0, 0, 0);
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.GetGroupCount");
 					GroupCount = FComputeShaderUtils::GetGroupCount(
 						FIntVector(Width, Height, 1),
 						FIntVector(
@@ -536,14 +909,12 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.AddDispatchPass");
 					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("UIComputerShaderObj::UploadProcessedCurveDataToGPU.Dispatch"),
+						RDG_EVENT_NAME("AIComputerShaderObj::UploadProcessedCurveDataToGPU.Dispatch"),
 						PassParameters,
 						ERDGPassFlags::AsyncCompute,
 						[ComputeShader, PassParameters, GroupCount](FRHIComputeCommandList& RHICmdList)
 						{
-							TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.DispatchRHI");
 							FComputeShaderUtils::Dispatch(
 								RHICmdList,
 								ComputeShader,
@@ -555,7 +926,6 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.GraphExecute");
 					GraphBuilder.Execute();
 				}
 			}
@@ -564,93 +934,46 @@ void UIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	}
 }
 
-void UIComputerShaderObj::SetSinWaveData(float offset, float coefficient, float baseLineHeight)
+void AIComputerShaderObj::SetSinWaveData(float offset, float coefficient, float baseLineHeight)
 {
-	SetMultiSinWaveData(offset, coefficient, 0.0f, MakeLegacyConfig(baseLineHeight));
+	SetRenderConfig(MakeLegacyConfig(baseLineHeight));
+	SetMultiSinWaveData(offset, coefficient, 0.0f);
 }
 
-void UIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep,
-                                              const FIComputerCurveRenderConfig& config)
+void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
 {
-	const int32 CurveCount = FMath::Max(1, config.CurveCount);
-	const int32 SampleCount = FMath::Max(2, config.SampleCount);
-
-	TArray<float> Values;
-	Values.SetNumUninitialized(CurveCount * SampleCount);
+	const int32 CurveCount = FMath::Max(1, RenderConfig.CurveCount);
+	const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
+	
+	SimulatedCurveValues.SetNum(CurveCount, false);
 
 	for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
 	{
+		TArray<float>& CurveSamples = SimulatedCurveValues[CurveIndex];
+		CurveSamples.SetNumUninitialized(SampleCount, false);
+
 		const float CurveOffset = offset + static_cast<float>(CurveIndex) * curvePhaseStep;
 		for (int32 SourceIndex = 0; SourceIndex < SampleCount; ++SourceIndex)
 		{
-			Values[CurveIndex * SampleCount + SourceIndex] =
-				FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
+			CurveSamples[SourceIndex] = FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
 		}
 	}
 
-	ProcessCurveData(Values, config);
+	bCurveProcessRequestPending = true;
 }
 
-void UIComputerShaderObj::SetCurveData(const TArray<float>& values, const FIComputerCurveRenderConfig& config)
+bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
 {
-	ProcessCurveData(values, config);
-}
-
-bool UIComputerShaderObj::ProcessCurveData(const TArray<float>& values, const FIComputerCurveRenderConfig& config)
-{
-	TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData");
-
 	const int32 Width = RenderTarget ? RenderTarget->SizeX : 1024;
 	const int32 Height = RenderTarget ? RenderTarget->SizeY : 1024;
-	const int32 CurveCount = FMath::Max(1, config.CurveCount);
-	const int32 SampleCount = FMath::Max(2, config.SampleCount);
-	const int64 RequiredValueCount = static_cast<int64>(CurveCount) * static_cast<int64>(SampleCount);
-
-	if (values.Num() < RequiredValueCount)
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.ResetInvalidInput");
-		TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
-		ResetCurveBuffers(Width, Height, config, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
-		MarkLineDataReadyForUpload();
-		return false;
-	}
-
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.UpdateDescriptors");
-		UpdateLineDrawDesc(LineDrawDesc, Width, Height, CurveCount);
-		BuildCurveColors(config, CurveColors);
-	}
-
-	// Stage 1: convert raw samples into draw-ready screen-space segments grouped by x bucket.
-	TArray<TArray<FCurveSegment>> BucketSegments;
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.InitBucketSegments");
-		BucketSegments.SetNum(FMath::Max(1, Width));
-	}
-
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.BuildBuckets");
-		for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
-		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.BuildBuckets.Curve");
-			const float BaseLine = config.BaseLineStart + static_cast<float>(CurveIndex) * config.BaseLineStep;
-			const int32 CurveValueOffset = CurveIndex * SampleCount;
-
-			auto GetSample = [&values, CurveValueOffset](int32 SourceIndex)
-			{
-				return values[CurveValueOffset + SourceIndex];
-			};
-
-			AddCurveToBuckets(CurveIndex, SampleCount, Width, BaseLine, config.ValueScale, GetSample, BucketSegments);
-		}
-	}
-
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("UIComputerShaderObj::ProcessCurveData.FlattenBuckets");
-		TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
-		FlattenBuckets(BucketSegments, BucketRanges, WritableLineData);
-		MarkLineDataReadyForUpload();
-	}
-
-	return true;
+	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
+		Values,
+		RenderConfig,
+		Width,
+		Height,
+		++CurveProcessGeneration
+	);
+	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
+	ApplyProcessedCurveData(MoveTemp(ProcessedData));
+	return bAcceptedInput;
 }
