@@ -297,11 +297,10 @@ namespace
 	}
 
 	FIComputerProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
-	                                                    const FIComputerCurveRenderConfig& RenderConfig,
-	                                                    int32 Width, int32 Height, int32 Generation)
+	                                                     const FIComputerCurveRenderConfig& RenderConfig,
+	                                                     int32 Width, int32 Height)
 	{
 		FIComputerProcessedCurveData ProcessedData;
-		ProcessedData.Generation = Generation;
 		ProcessedData.Width = Width;
 		ProcessedData.Height = Height;
 
@@ -395,7 +394,15 @@ namespace
 class FComputerCurveProcessWorker final : public FRunnable
 {
 public:
-	FComputerCurveProcessWorker()
+	FComputerCurveProcessWorker(const TArray<TArray<float>>* InValuesPtr,
+	                            const FIComputerCurveRenderConfig* InConfigPtr,
+	                            FCriticalSection* InSourceCriticalSection,
+	                            int32 InWidth, int32 InHeight)
+		: ValuesPtr(InValuesPtr)
+		  , ConfigPtr(InConfigPtr)
+		  , SourceCriticalSection(InSourceCriticalSection)
+		  , Width(InWidth)
+		  , Height(InHeight)
 	{
 		WorkEvent = FPlatformProcess::GetSynchEventFromPool(false);
 		Thread = FRunnableThread::Create(this, TEXT("IComputerShader_CurveProcessWorker"), 0, TPri_BelowNormal);
@@ -410,28 +417,28 @@ public:
 	{
 		while (!bStopRequested)
 		{
-			WorkEvent->Wait();
+			TArray<TArray<float>> ValuesSnapshot;
+			FIComputerCurveRenderConfig ConfigSnapshot;
+			bool bHasInput = false;
 
-			while (!bStopRequested)
+			if (ValuesPtr && ConfigPtr && SourceCriticalSection)
 			{
-				FRequest Request;
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::SnapshotInput");
+				FScopeLock Lock(SourceCriticalSection);
+				if (ValuesPtr->Num() > 0)
 				{
-					FScopeLock Lock(&RequestCriticalSection);
-					if (!bHasPendingRequest)
-					{
-						break;
-					}
-
-					Request = MoveTemp(PendingRequest);
-					bHasPendingRequest = false;
+					ValuesSnapshot = *ValuesPtr;
+					ConfigSnapshot = *ConfigPtr;
+					bHasInput = true;
 				}
-
+			}
+			if (bHasInput)
+			{
 				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
-					Request.Values,
-					Request.Config,
-					Request.Width,
-					Request.Height,
-					Request.Generation
+					ValuesSnapshot,
+					ConfigSnapshot,
+					Width,
+					Height
 				);
 
 				{
@@ -440,6 +447,14 @@ public:
 					bHasCompletedResult = true;
 				}
 			}
+
+			if (bStopRequested)
+			{
+				break;
+			}
+
+			WorkEvent->Wait(0.005f);
+			WorkEvent->Trigger();
 		}
 
 		return 0;
@@ -452,22 +467,6 @@ public:
 		{
 			WorkEvent->Trigger();
 		}
-	}
-
-	void Enqueue(TArray<TArray<float>>&& Values, const FIComputerCurveRenderConfig& Config, int32 Width, int32 Height,
-	             int32 Generation)
-	{
-		{
-			FScopeLock Lock(&RequestCriticalSection);
-			PendingRequest.Values = MoveTemp(Values);
-			PendingRequest.Config = Config;
-			PendingRequest.Width = Width;
-			PendingRequest.Height = Height;
-			PendingRequest.Generation = Generation;
-			bHasPendingRequest = true;
-		}
-
-		WorkEvent->Trigger();
 	}
 
 	bool DequeueResult(FIComputerProcessedCurveData& OutResult)
@@ -502,25 +501,18 @@ public:
 	}
 
 private:
-	struct FRequest
-	{
-		TArray<TArray<float>> Values;
-		FIComputerCurveRenderConfig Config;
-		int32 Width = 0;
-		int32 Height = 0;
-		int32 Generation = 0;
-	};
+	const TArray<TArray<float>>* ValuesPtr = nullptr;
+	const FIComputerCurveRenderConfig* ConfigPtr = nullptr;
+	int32 Width = 0;
+	int32 Height = 0;
 
 	FRunnableThread* Thread = nullptr;
 	FEvent* WorkEvent = nullptr;
 	FThreadSafeBool bStopRequested = false;
 
-	FCriticalSection RequestCriticalSection;
-	FRequest PendingRequest;
-	bool bHasPendingRequest = false;
-
 	FCriticalSection ResultCriticalSection;
 	FIComputerProcessedCurveData CompletedResult;
+	FCriticalSection* SourceCriticalSection = nullptr;
 	bool bHasCompletedResult = false;
 };
 
@@ -619,7 +611,6 @@ void AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&&
 		WritableLineData.AddZeroed(1);
 	}
 
-	LastAppliedCurveProcessGeneration = FMath::Max(LastAppliedCurveProcessGeneration, ProcessedData.Generation);
 	MarkLineDataReadyForUpload();
 }
 
@@ -636,34 +627,13 @@ bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 He
 		return false;
 	}
 
-	if (ProcessedData.Generation <= LastAppliedCurveProcessGeneration)
-	{
-		return false;
-	}
-
 	if (ProcessedData.Width != Width || ProcessedData.Height != Height)
 	{
-		bCurveProcessRequestPending = true;
 		return false;
 	}
 
 	ApplyProcessedCurveData(MoveTemp(ProcessedData));
 	return true;
-}
-
-void AIComputerShaderObj::RequestWorkerCurveProcess(int32 Width, int32 Height)
-{
-	if (!bCurveProcessRequestPending)
-	{
-		return;
-	}
-
-	TArray<TArray<float>> ValuesSnapshot = SimulatedCurveValues;
-	FIComputerCurveRenderConfig ConfigSnapshot = RenderConfig;
-	const int32 Generation = ++CurveProcessGeneration;
-	bCurveProcessRequestPending = false;
-
-	CurveProcessWorker->Enqueue(MoveTemp(ValuesSnapshot), ConfigSnapshot, Width, Height, Generation);
 }
 
 void AIComputerShaderObj::ShutdownCurveProcessWorker()
@@ -687,21 +657,28 @@ void AIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
 	RenderTarget->UpdateResourceImmediate(true);
 
 	ResetCurveDataToSafeBuffers(RenderTargetWidth, RenderTargetHeight, RenderConfig.CurveCount);
-	bCurveProcessRequestPending = true;
 }
 
 void AIComputerShaderObj::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (!CurveProcessWorker)
-	{
-		CurveProcessWorker = new FComputerCurveProcessWorker();
-	}
-
-	if (bCreateRenderTargetOnBeginPlay && !RenderTarget)
+	if (!RenderTarget)
 	{
 		CreateRenderTarget(RenderTargetWidth, RenderTargetHeight);
+	}
+
+	SimulatedRunningPhase = SimulatedSinOffset;
+	SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
+
+	WorkerWidth = RenderTarget ? RenderTarget->SizeX : RenderTargetWidth;
+	WorkerHeight = RenderTarget ? RenderTarget->SizeY : RenderTargetHeight;
+
+	if (!CurveProcessWorker)
+	{
+		CurveProcessWorker = new FComputerCurveProcessWorker(&SimulatedCurveValues, &RenderConfig,
+														&SimulatedCurveValuesCriticalSection, WorkerWidth,
+														WorkerHeight);
 	}
 }
 
@@ -751,8 +728,8 @@ void AIComputerShaderObj::Execute()
 
 void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
 {
+	FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
 	RenderConfig = InConfig;
-	bCurveProcessRequestPending = true;
 }
 
 FIComputerCurveRenderConfig AIComputerShaderObj::GetRenderConfig() const
@@ -779,9 +756,7 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 		Height = RenderTarget->SizeY;
 	}
 
-	bCurveProcessRequestPending = true;
 	TryApplyWorkerCurveProcessResult(Width, Height);
-	RequestWorkerCurveProcess(Width, Height);
 
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
 	int32 LineDataUploadBufferIndex = INDEX_NONE;
@@ -841,10 +816,10 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	{
 		ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
 			[RenderTargetResource, Width, Height, LineDrawDescCopy = MoveTemp(LineDrawDescCopy),
-					LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
-					BucketRangesCopy = MoveTemp(BucketRangesCopy),
-					CurveColorsCopy = MoveTemp(CurveColorsCopy)](
-				FRHICommandListImmediate& RHICmdList)
+				LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
+				BucketRangesCopy = MoveTemp(BucketRangesCopy),
+				CurveColorsCopy = MoveTemp(CurveColorsCopy)](
+			FRHICommandListImmediate& RHICmdList)
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread");
 
@@ -876,12 +851,15 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
-					TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
+					TRACE_CPUPROFILER_EVENT_SCOPE_STR(
+						"AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
 					const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
 					FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
-					                                                      sizeof(FCurveSegmentGPU), LineDataUpload.Num(),
+					                                                      sizeof(FCurveSegmentGPU),
+					                                                      LineDataUpload.Num(),
 					                                                      LineDataUpload.GetData(),
-					                                                      sizeof(FCurveSegmentGPU) * LineDataUpload.Num());
+					                                                      sizeof(FCurveSegmentGPU) * LineDataUpload.
+					                                                      Num());
 					PassParameters->LineData = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(LineDataBuffer));
 				}
 
@@ -952,6 +930,8 @@ void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, f
 	const int32 CurveCount = FMath::Max(1, RenderConfig.CurveCount);
 	const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
 	
+	FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
+	
 	SimulatedCurveValues.SetNum(CurveCount, false);
 
 	for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
@@ -965,8 +945,6 @@ void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, f
 			CurveSamples[SourceIndex] = FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
 		}
 	}
-
-	bCurveProcessRequestPending = true;
 }
 
 bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
@@ -977,8 +955,7 @@ bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
 		Values,
 		RenderConfig,
 		Width,
-		Height,
-		++CurveProcessGeneration
+		Height
 	);
 	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
 	ApplyProcessedCurveData(MoveTemp(ProcessedData));

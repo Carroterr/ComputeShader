@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "IComputerShader.h"
 #include "RenderCommandFence.h"
+#include "HAL/CriticalSection.h"
 #include "IComputerShaderObj.generated.h"
 
 class UTextureRenderTarget2D;
@@ -15,19 +16,19 @@ struct COMPUTESHADER_API FIComputerCurveRenderConfig
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	int32 CurveCount = 1;
+	int32 CurveCount = 100;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
 	int32 SampleCount = 5000;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	float BaseLineStart = 512.0f;
+	float BaseLineStart = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	float BaseLineStep = 128.0f;
+	float BaseLineStep = 10.f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
-	float ValueScale = 100.0f;
+	float ValueScale = 20.f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader")
 	TArray<FLinearColor> CurveColors;
@@ -44,7 +45,6 @@ struct COMPUTESHADER_API FIComputerCurveSamples
 
 struct FIComputerProcessedCurveData
 {
-	int32 Generation = 0;
 	int32 Width = 0;
 	int32 Height = 0;
 	bool bAcceptedInput = false;
@@ -93,16 +93,14 @@ public:
 
 	// 临时正弦波数据源模拟入口：生成 CurveCount 条曲线，每条曲线包含 SampleCount 个原始样本。
 	// 生成结果复用内部 SimulatedCurveValues 缓存，然后走二维数组版本的 ProcessCurveData。
-	UFUNCTION(BlueprintCallable)
 	void SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep);
-	
+
 private:
 	TArray<FCurveSegmentGPU>& GetWritableLineDataBuffer();
 	void MarkLineDataReadyForUpload();
 	void ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount);
 	void ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData);
 	bool TryApplyWorkerCurveProcessResult(int32 Width, int32 Height);
-	void RequestWorkerCurveProcess(int32 Width, int32 Height);
 	void ShutdownCurveProcessWorker();
 
 	UPROPERTY(Transient)
@@ -123,20 +121,32 @@ private:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|RenderTarget", meta = (AllowPrivateAccess = "true", ClampMin = "1"))
 	int32 RenderTargetHeight = 1024;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|RenderTarget", meta = (AllowPrivateAccess = "true"))
-	bool bCreateRenderTargetOnBeginPlay = true;
-	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Simulation", meta = (AllowPrivateAccess = "true"))
+	float SimulatedSinOffset = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Simulation", meta = (AllowPrivateAccess = "true"))
+	float SimulatedSinCoefficient = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Simulation", meta = (AllowPrivateAccess = "true"))
+	float SimulatedCurvePhaseStep = 0.0f;
+
+	// 每秒推进的相位（弧度），让 sin 波形横向滚动。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ComputeShader|Simulation", meta = (AllowPrivateAccess = "true"))
+	float SimulatedScrollSpeed = 2.0f;
+
 	enum { LineDataUploadBufferCount = 3 };
 
 	TArray<float> LineDrawDesc;
 	// SetMultiSinWaveData 专用的模拟原始数据缓存，布局为 [CurveIndex][SourceIndex]。
 	// 不标记 UPROPERTY：UE 反射不支持 TArray<TArray<float>>，这里也不需要暴露给蓝图。
 	TArray<TArray<float>> SimulatedCurveValues;
+	// 保护 SimulatedCurveValues 与 RenderConfig 的并发访问（game thread 写，worker thread 读）。
+	mutable FCriticalSection SimulatedCurveValuesCriticalSection;
+	float SimulatedRunningPhase = 0.0f;
 	FComputerCurveProcessWorker* CurveProcessWorker = nullptr;
-	int32 CurveProcessGeneration = 0;
-	int32 LastAppliedCurveProcessGeneration = 0;
+	int32 WorkerWidth = 0;
+	int32 WorkerHeight = 0;
 	float UploadTickAccumulatorSeconds = 0.0f;
-	bool bCurveProcessRequestPending = false;
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataBuffers[LineDataUploadBufferCount];
 	FRenderCommandFence LineDataUploadFences[LineDataUploadBufferCount];
 	int32 LineDataWriteBufferIndex = 0;
