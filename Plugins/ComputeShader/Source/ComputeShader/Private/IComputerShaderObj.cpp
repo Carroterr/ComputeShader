@@ -11,6 +11,8 @@
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "RenderGraphUtils.h"
 
+#include <atomic>
+
 class FIComputerShader;
 
 namespace
@@ -400,10 +402,11 @@ public:
 	                            int32 InWidth, int32 InHeight)
 		: ValuesPtr(InValuesPtr)
 		  , ConfigPtr(InConfigPtr)
-		  , SourceCriticalSection(InSourceCriticalSection)
 		  , Width(InWidth)
 		  , Height(InHeight)
+		  , SourceCriticalSection(InSourceCriticalSection)
 	{
+		// 后台线程只负责 CPU 侧预处理：把原始采样转换成 shader 可直接消费的线段/bucket buffer。
 		WorkEvent = FPlatformProcess::GetSynchEventFromPool(false);
 		Thread = FRunnableThread::Create(this, TEXT("IComputerShader_CurveProcessWorker"), 0, TPri_BelowNormal);
 	}
@@ -415,8 +418,23 @@ public:
 
 	virtual uint32 Run() override
 	{
+		uint64 LastProcessedRequestCount = 0;
+
 		while (!bStopRequested)
 		{
+			WorkEvent->Wait();
+			if (bStopRequested)
+			{
+				break;
+			}
+
+			const uint64 CurrentRequestCount = WorkRequestCounter.load(std::memory_order_relaxed);
+			if (CurrentRequestCount == LastProcessedRequestCount)
+			{
+				continue;
+			}
+			LastProcessedRequestCount = CurrentRequestCount;
+
 			TArray<TArray<float>> ValuesSnapshot;
 			FIComputerCurveRenderConfig ConfigSnapshot;
 			bool bHasInput = false;
@@ -424,6 +442,7 @@ public:
 			if (ValuesPtr && ConfigPtr && SourceCriticalSection)
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::SnapshotInput");
+				// 只在拷贝输入时加锁；真正耗时的 M4 降采样/分桶在锁外做，避免卡住 game thread 写入新波形。
 				FScopeLock Lock(SourceCriticalSection);
 				if (ValuesPtr->Num() > 0)
 				{
@@ -434,6 +453,7 @@ public:
 			}
 			if (bHasInput)
 			{
+				// BuildProcessedCurveData 是纯 CPU 工作：降采样、生成线段、按屏幕 x 分桶，不接触 UObject/RHI。
 				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
 					ValuesSnapshot,
 					ConfigSnapshot,
@@ -442,19 +462,12 @@ public:
 				);
 
 				{
+					// 只保留最新一帧结果；如果 game thread 来不及上传，旧结果会被新结果覆盖。
 					FScopeLock Lock(&ResultCriticalSection);
 					CompletedResult = MoveTemp(Result);
 					bHasCompletedResult = true;
 				}
 			}
-
-			if (bStopRequested)
-			{
-				break;
-			}
-
-			WorkEvent->Wait(0.005f);
-			WorkEvent->Trigger();
 		}
 
 		return 0;
@@ -469,6 +482,15 @@ public:
 		}
 	}
 
+	void RequestWork()
+	{
+		WorkRequestCounter.fetch_add(1, std::memory_order_relaxed);
+		if (WorkEvent)
+		{
+			WorkEvent->Trigger();
+		}
+	}
+
 	bool DequeueResult(FIComputerProcessedCurveData& OutResult)
 	{
 		FScopeLock Lock(&ResultCriticalSection);
@@ -477,6 +499,7 @@ public:
 			return false;
 		}
 
+		// game thread 在 UploadProcessedCurveDataToGPU 开头取走结果，然后再进入渲染线程上传。
 		OutResult = MoveTemp(CompletedResult);
 		bHasCompletedResult = false;
 		return true;
@@ -509,6 +532,7 @@ private:
 	FRunnableThread* Thread = nullptr;
 	FEvent* WorkEvent = nullptr;
 	FThreadSafeBool bStopRequested = false;
+	std::atomic<uint64> WorkRequestCounter{0};
 
 	FCriticalSection ResultCriticalSection;
 	FIComputerProcessedCurveData CompletedResult;
@@ -524,6 +548,8 @@ AIComputerShaderObj::AIComputerShaderObj()
 
 TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 {
+	// LineDataBuffers 是按需创建的三缓冲槽。每个槽保存一整帧 LineData，
+	// 后续可能被 render command 通过 SharedPtr 持有，所以不能随便覆盖。
 	auto EnsureBuffer = [](TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>& Buffer)
 		-> TArray<FCurveSegmentGPU>&
 	{
@@ -537,9 +563,13 @@ TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 
 	auto IsBufferWritable = [this](int32 BufferIndex)
 	{
+		// 可写条件有两个：
+		// 1. 不是 ready 槽，避免覆盖“已经写完但还没上传”的数据。
+		// 2. fence 已完成，说明 render thread 不再读取这个槽。
 		return BufferIndex != LineDataReadyBufferIndex && LineDataUploadFences[BufferIndex].IsFenceComplete();
 	};
 
+	// 优先沿用当前 WriteIndex；如果它还被 ready 或 render thread 占着，就在另外两个槽里找一个空闲槽。
 	if (!IsBufferWritable(LineDataWriteBufferIndex))
 	{
 		for (int32 Offset = 1; Offset < LineDataUploadBufferCount; ++Offset)
@@ -553,6 +583,8 @@ TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 		}
 	}
 
+	// 三个槽都不可写时，当前实现选择等待一个非 ready 槽完成，保证数据正确但可能造成 game thread 卡顿。
+	// 如果要进一步优化实时波形，可以把这里改成“拿不到可写槽就丢掉本帧结果”。
 	if (!IsBufferWritable(LineDataWriteBufferIndex))
 	{
 		int32 WaitBufferIndex = INDEX_NONE;
@@ -571,7 +603,6 @@ TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 		}
 
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.WaitForLineDataUploadBuffer");
 			LineDataUploadFences[WaitBufferIndex].Wait();
 		}
 
@@ -583,6 +614,9 @@ TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 
 void AIComputerShaderObj::MarkLineDataReadyForUpload()
 {
+	// 当前 WriteIndex 已经填入一帧完整 LineData：
+	// - 先把它发布成 ready 槽，等待 UploadProcessedCurveDataToGPU 取走。
+	// - 再把 WriteIndex 推到下一个槽，为下一帧 CPU 结果预留写入位置。
 	bHasPendingLineDataUpload = true;
 	LineDataReadyBufferIndex = LineDataWriteBufferIndex;
 	LineDataWriteBufferIndex = (LineDataWriteBufferIndex + 1) % LineDataUploadBufferCount;
@@ -677,30 +711,27 @@ void AIComputerShaderObj::BeginPlay()
 	if (!CurveProcessWorker)
 	{
 		CurveProcessWorker = new FComputerCurveProcessWorker(&SimulatedCurveValues, &RenderConfig,
-														&SimulatedCurveValuesCriticalSection, WorkerWidth,
-														WorkerHeight);
+		                                                     &SimulatedCurveValuesCriticalSection, WorkerWidth,
+		                                                     WorkerHeight);
 	}
+	CurveProcessWorker->RequestWork();
 }
 
 void AIComputerShaderObj::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (bAutoUploadToGPU)
-	{
-		const float SafeFrequencyHz = FMath::Max(0.1f, UploadFrequencyHz);
-		const float UploadIntervalSeconds = 1.0f / SafeFrequencyHz;
-		UploadTickAccumulatorSeconds += DeltaSeconds;
+	UploadTickAccumulatorSeconds += DeltaSeconds;
 
-		if (UploadTickAccumulatorSeconds >= UploadIntervalSeconds)
-		{
-			UploadTickAccumulatorSeconds = FMath::Fmod(UploadTickAccumulatorSeconds, UploadIntervalSeconds);
-			UploadProcessedCurveDataToGPU();
-		}
-	}
-	else
+	//30hz运行速度
+	if (UploadTickAccumulatorSeconds >= 0.033f)
 	{
-		UploadTickAccumulatorSeconds = 0.0f;
+		UploadTickAccumulatorSeconds -= 0.033f;
+		// SetMultiSinWaveData 的 offset 是弧度；持续推进相位后，CPU 采样数据会变化，后台 worker 会处理出新的线段。
+		SimulatedRunningPhase = FMath::Fmod(SimulatedRunningPhase + DeltaSeconds * SimulatedScrollSpeed, 2.0f * PI);
+		SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
+
+		UploadProcessedCurveDataToGPU();
 	}
 }
 
@@ -728,8 +759,15 @@ void AIComputerShaderObj::Execute()
 
 void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
 {
-	FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
-	RenderConfig = InConfig;
+	{
+		FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
+		RenderConfig = InConfig;
+	}
+
+	if (CurveProcessWorker)
+	{
+		CurveProcessWorker->RequestWork();
+	}
 }
 
 FIComputerCurveRenderConfig AIComputerShaderObj::GetRenderConfig() const
@@ -761,12 +799,15 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe> LineDataUploadBuffer;
 	int32 LineDataUploadBufferIndex = INDEX_NONE;
 	{
+		// 这里消费 ready 槽：如果没有待上传 LineData，或者 ready 槽还没创建，就没有必要 dispatch。
 		if (!bHasPendingLineDataUpload || LineDataReadyBufferIndex == INDEX_NONE ||
 			!LineDataBuffers[LineDataReadyBufferIndex].IsValid())
 		{
 			return;
 		}
 
+		// 不复制 LineData 大数组，只拿 ready 槽的 SharedPtr。
+		// 这个 SharedPtr 会被 render command 捕获，保证 render thread 执行前数组不会被释放。
 		LineDataUploadBufferIndex = LineDataReadyBufferIndex;
 		LineDataUploadBuffer = LineDataBuffers[LineDataUploadBufferIndex];
 		if (LineDataUploadBuffer->Num() == 0)
@@ -774,6 +815,8 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 			LineDataUploadBuffer->AddZeroed(1);
 		}
 
+		// ready 槽已经交给本次上传流程；从 game thread 视角看，当前没有新的 ready 槽。
+		// 但这个槽还不能马上复用，复用要等下面 BeginFence 对应的 fence 完成。
 		bHasPendingLineDataUpload = false;
 		LineDataReadyBufferIndex = INDEX_NONE;
 	}
@@ -814,6 +857,8 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	// Stage 2: copy processed CPU buffers to the render thread, upload them with RDG, then dispatch.
 	{
+		// LineDrawDesc/BucketRanges/CurveColors 都已经复制成局部变量并 move 捕获。
+		// LineDataUploadBuffer 则是三缓冲槽的 SharedPtr，避免在 game thread 再深拷贝大数组。
 		ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
 			[RenderTargetResource, Width, Height, LineDrawDescCopy = MoveTemp(LineDrawDescCopy),
 				LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
@@ -853,6 +898,8 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				{
 					TRACE_CPUPROFILER_EVENT_SCOPE_STR(
 						"AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
+					// render thread 在这里读取被捕获的三缓冲槽，并把线段数据上传成 RDG StructuredBuffer。
+					// 直到对应 fence 完成前，game thread 都不能覆盖这个槽。
 					const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
 					FRDGBufferRef LineDataBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("LineDataBuffer"),
 					                                                      sizeof(FCurveSegmentGPU),
@@ -915,35 +962,46 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 			}
 		);
+		// 标记本次 render command 对该槽的使用范围。之后 IsFenceComplete() 返回 true，
+		// 才表示这个 LineDataBuffers[LineDataUploadBufferIndex] 可以重新作为 write 槽。
 		LineDataUploadFences[LineDataUploadBufferIndex].BeginFence();
 	}
 }
 
-void AIComputerShaderObj::SetSinWaveData(float offset, float coefficient, float baseLineHeight)
-{
-	SetRenderConfig(MakeLegacyConfig(baseLineHeight));
-	SetMultiSinWaveData(offset, coefficient, 0.0f);
-}
-
 void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
 {
-	const int32 CurveCount = FMath::Max(1, RenderConfig.CurveCount);
-	const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
-	
-	FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
-	
-	SimulatedCurveValues.SetNum(CurveCount, false);
-
-	for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
 	{
-		TArray<float>& CurveSamples = SimulatedCurveValues[CurveIndex];
-		CurveSamples.SetNumUninitialized(SampleCount, false);
+		FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
 
-		const float CurveOffset = offset + static_cast<float>(CurveIndex) * curvePhaseStep;
-		for (int32 SourceIndex = 0; SourceIndex < SampleCount; ++SourceIndex)
+		// 记录最近一次模拟参数，Tick 推进相位时会沿用它们继续生成后续帧。
+		SimulatedRunningPhase = offset;
+		SimulatedSinCoefficient = coefficient;
+		SimulatedCurvePhaseStep = curvePhaseStep;
+
+		const int32 CurveCount = FMath::Max(1, RenderConfig.CurveCount);
+		const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
+
+		// 临时 sin 模拟数据直接复用 SimulatedCurveValues 的已有容量，避免每帧创建/搬移 NewCurveValues。
+		// 这里必须持锁写完整帧，防止 worker snapshot 到写了一半的曲线数据。
+		SimulatedCurveValues.SetNum(CurveCount, false);
+
+		for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
 		{
-			CurveSamples[SourceIndex] = FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
+			TArray<float>& CurveSamples = SimulatedCurveValues[CurveIndex];
+			CurveSamples.SetNumUninitialized(SampleCount, false);
+
+			const float CurveOffset = offset + static_cast<float>(CurveIndex) * curvePhaseStep;
+			for (int32 SourceIndex = 0; SourceIndex < SampleCount; ++SourceIndex)
+			{
+				CurveSamples[SourceIndex] =
+					FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
+			}
 		}
+	}
+
+	if (CurveProcessWorker)
+	{
+		CurveProcessWorker->RequestWork();
 	}
 }
 
