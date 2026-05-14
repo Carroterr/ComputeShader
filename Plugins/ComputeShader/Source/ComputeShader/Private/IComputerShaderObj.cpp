@@ -9,11 +9,15 @@
 #include "HAL/RunnableThread.h"
 #include "HAL/ThreadSafeBool.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h"
+#include "RenderGraphEvent.h"
 #include "RenderGraphUtils.h"
 
 #include <atomic>
 
 class FIComputerShader;
+
+DECLARE_GPU_STAT_NAMED(IComputerShaderDispatch, TEXT("IComputerShader Dispatch"));
 
 namespace
 {
@@ -22,6 +26,7 @@ namespace
 	constexpr int32 GLegacySourceCount = 5000;
 	constexpr float GLegacySinAmplitude = 1000.0f;
 	constexpr float GBinningExpand = 2.0f;
+	constexpr int32 GTileHeight = 64;
 
 	struct FReducedWavePoint
 	{
@@ -44,6 +49,70 @@ namespace
 		FCurveSegment Segment;
 		int32 StartBucket = 0;
 		int32 EndBucket = 0;
+	};
+
+	struct FCurveProcessScratch
+	{
+		TArray<FBinnedCurveSegment> BinnedSegments;
+		TArray<int32> BucketCounts;
+		TArray<int32> CellCounts;
+		TArray<uint32> CellWriteOffsets;
+	};
+
+	struct FSineSampleGenerator
+	{
+		explicit FSineSampleGenerator(float InOffset, float InCoefficientDegrees)
+			: Offset(InOffset)
+			  , CoefficientDegrees(InCoefficientDegrees)
+		{
+			const float StepRadians = FMath::DegreesToRadians(InCoefficientDegrees);
+			FMath::SinCos(&StepSin, &StepCos, StepRadians);
+			FMath::SinCos(&CurrentSin, &CurrentCos, Offset);
+		}
+
+		float GetSample(int32 SourceIndex)
+		{
+			if (SourceIndex == CachedIndex)
+			{
+				return CurrentSin;
+			}
+
+			if (SourceIndex == CachedIndex + 1)
+			{
+				Advance();
+				return CurrentSin;
+			}
+
+			const float Angle = Offset + FMath::DegreesToRadians(static_cast<float>(SourceIndex) * CoefficientDegrees);
+			FMath::SinCos(&CurrentSin, &CurrentCos, Angle);
+			CachedIndex = SourceIndex;
+			return CurrentSin;
+		}
+
+	private:
+		void Advance()
+		{
+			const float NextSin = CurrentSin * StepCos + CurrentCos * StepSin;
+			const float NextCos = CurrentCos * StepCos - CurrentSin * StepSin;
+			CurrentSin = NextSin;
+			CurrentCos = NextCos;
+			++CachedIndex;
+
+			if ((CachedIndex & 1023) == 0)
+			{
+				const float InvLength = FMath::InvSqrt(FMath::Max(CurrentSin * CurrentSin + CurrentCos * CurrentCos, SMALL_NUMBER));
+				CurrentSin *= InvLength;
+				CurrentCos *= InvLength;
+			}
+		}
+
+		float Offset = 0.0f;
+		float CoefficientDegrees = 0.0f;
+		float StepSin = 0.0f;
+		float StepCos = 1.0f;
+		float CurrentSin = 0.0f;
+		float CurrentCos = 1.0f;
+		int32 CachedIndex = 0;
 	};
 
 	// Returns a fallback color when the user did not configure one for this curve.
@@ -88,7 +157,7 @@ namespace
 		OutLineDrawDesc.SetNumZeroed(GLineDrawDescFloatCount);
 		OutLineDrawDesc[0] = static_cast<float>(Width);
 		OutLineDrawDesc[1] = static_cast<float>(Height);
-		OutLineDrawDesc[2] = 0.0f;
+		OutLineDrawDesc[2] = static_cast<float>(FMath::DivideAndRoundUp(FMath::Max(1, Height), GTileHeight));
 		OutLineDrawDesc[3] = static_cast<float>(FMath::Max(1, CurveCount));
 	}
 
@@ -106,7 +175,7 @@ namespace
 		OutLineData.Reset(1);
 		OutLineData.AddZeroed(1);
 
-		OutBucketRanges.SetNumZeroed(SafeWidth * GBucketRangeUintCount);
+		OutBucketRanges.SetNumZeroed(SafeWidth * FMath::DivideAndRoundUp(SafeHeight, GTileHeight) * GBucketRangeUintCount);
 		BuildCurveColors(Config, OutCurveColors);
 	}
 
@@ -247,28 +316,52 @@ namespace
 		}
 	}
 
-	// Builds final GPU buffers directly from binned segments.
-	// BucketRanges[x * 2 + 0/1] records each column's offset/count in OutLineData.
+	// Builds final GPU buffers with 2D (x, yTile) binning.
+	// BucketRanges[(x * TileCountY + yTile) * 2 + 0/1] = offset, count in OutLineData.
 	void BuildBucketRangesAndLineData(const TArray<FBinnedCurveSegment>& BinnedSegments,
-	                                  const TArray<int32>& BucketCounts, TArray<uint32>& OutBucketRanges,
+	                                  const TArray<int32>& BucketCounts, int32 Height,
+	                                  FCurveProcessScratch& Scratch,
+	                                  TArray<uint32>& OutBucketRanges,
 	                                  TArray<FCurveSegmentGPU>& OutLineData)
 	{
 		const int32 Width = BucketCounts.Num();
+		const int32 TileCountY = FMath::DivideAndRoundUp(FMath::Max(1, Height), GTileHeight);
+		const int32 TotalCells = Width * TileCountY;
+		const float TileExpand = GBinningExpand + 1.5f;
+
+		// First pass: count segments per (x, yTile) cell.
+		TArray<int32>& CellCounts = Scratch.CellCounts;
+		CellCounts.SetNumZeroed(TotalCells, false);
+
+		for (const FBinnedCurveSegment& BinnedSegment : BinnedSegments)
+		{
+			const FCurveSegment& Segment = BinnedSegment.Segment;
+			const float SegMinY = FMath::Min(Segment.Y0, Segment.Y1) - TileExpand;
+			const float SegMaxY = FMath::Max(Segment.Y0, Segment.Y1) + TileExpand;
+			const int32 StartTile = FMath::Clamp(FMath::FloorToInt(SegMinY / static_cast<float>(GTileHeight)), 0, TileCountY - 1);
+			const int32 EndTile = FMath::Clamp(FMath::FloorToInt(SegMaxY / static_cast<float>(GTileHeight)), 0, TileCountY - 1);
+
+			for (int32 BucketIndex = BinnedSegment.StartBucket; BucketIndex <= BinnedSegment.EndBucket; ++BucketIndex)
+			{
+				for (int32 TileIndex = StartTile; TileIndex <= EndTile; ++TileIndex)
+				{
+					++CellCounts[BucketIndex * TileCountY + TileIndex];
+				}
+			}
+		}
+
+		// Build offsets
+		OutBucketRanges.SetNumUninitialized(TotalCells * GBucketRangeUintCount);
+		TArray<uint32>& CellWriteOffsets = Scratch.CellWriteOffsets;
+		CellWriteOffsets.SetNumUninitialized(TotalCells, false);
 		int32 TotalSegmentCount = 0;
 
-		OutBucketRanges.SetNumUninitialized(Width * GBucketRangeUintCount);
-		TArray<uint32> BucketWriteOffsets;
-		BucketWriteOffsets.SetNumUninitialized(Width);
-
-		for (int32 BucketIndex = 0; BucketIndex < Width; ++BucketIndex)
+		for (int32 CellIndex = 0; CellIndex < TotalCells; ++CellIndex)
 		{
-			const uint32 SegmentOffset = static_cast<uint32>(TotalSegmentCount);
-			const int32 BucketSegmentCount = BucketCounts[BucketIndex];
-
-			OutBucketRanges[BucketIndex * GBucketRangeUintCount] = SegmentOffset;
-			OutBucketRanges[BucketIndex * GBucketRangeUintCount + 1] = static_cast<uint32>(BucketSegmentCount);
-			BucketWriteOffsets[BucketIndex] = SegmentOffset;
-			TotalSegmentCount += BucketSegmentCount;
+			OutBucketRanges[CellIndex * GBucketRangeUintCount] = static_cast<uint32>(TotalSegmentCount);
+			OutBucketRanges[CellIndex * GBucketRangeUintCount + 1] = static_cast<uint32>(CellCounts[CellIndex]);
+			CellWriteOffsets[CellIndex] = static_cast<uint32>(TotalSegmentCount);
+			TotalSegmentCount += CellCounts[CellIndex];
 		}
 
 		if (TotalSegmentCount == 0)
@@ -278,29 +371,40 @@ namespace
 			return;
 		}
 
+		// Scatter segments into cells
 		OutLineData.SetNumUninitialized(TotalSegmentCount);
 
 		for (const FBinnedCurveSegment& BinnedSegment : BinnedSegments)
 		{
 			const FCurveSegment& Segment = BinnedSegment.Segment;
+			const float SegMinY = FMath::Min(Segment.Y0, Segment.Y1) - TileExpand;
+			const float SegMaxY = FMath::Max(Segment.Y0, Segment.Y1) + TileExpand;
+			const int32 StartTile = FMath::Clamp(FMath::FloorToInt(SegMinY / static_cast<float>(GTileHeight)), 0, TileCountY - 1);
+			const int32 EndTile = FMath::Clamp(FMath::FloorToInt(SegMaxY / static_cast<float>(GTileHeight)), 0, TileCountY - 1);
+
 			for (int32 BucketIndex = BinnedSegment.StartBucket; BucketIndex <= BinnedSegment.EndBucket; ++BucketIndex)
 			{
-				FCurveSegmentGPU& Out = OutLineData[BucketWriteOffsets[BucketIndex]++];
-				Out.X0 = Segment.X0;
-				Out.Y0 = Segment.Y0;
-				Out.X1 = Segment.X1;
-				Out.Y1 = Segment.Y1;
-				Out.CurveIndex = Segment.CurveIndex;
-				Out._Pad0 = 0;
-				Out._Pad1 = 0;
-				Out._Pad2 = 0;
+				for (int32 TileIndex = StartTile; TileIndex <= EndTile; ++TileIndex)
+				{
+					const int32 CellIndex = BucketIndex * TileCountY + TileIndex;
+					FCurveSegmentGPU& Out = OutLineData[CellWriteOffsets[CellIndex]++];
+					Out.X0 = Segment.X0;
+					Out.Y0 = Segment.Y0;
+					Out.X1 = Segment.X1;
+					Out.Y1 = Segment.Y1;
+					Out.CurveIndex = Segment.CurveIndex;
+					Out._Pad0 = 0;
+					Out._Pad1 = 0;
+					Out._Pad2 = 0;
+				}
 			}
 		}
 	}
 
 	FIComputerProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
 	                                                     const FIComputerCurveRenderConfig& RenderConfig,
-	                                                     int32 Width, int32 Height)
+	                                                     int32 Width, int32 Height,
+	                                                     FCurveProcessScratch& Scratch)
 	{
 		FIComputerProcessedCurveData ProcessedData;
 		ProcessedData.Width = Width;
@@ -342,13 +446,14 @@ namespace
 		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
 		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
 
-		TArray<FBinnedCurveSegment> BinnedSegments;
-		TArray<int32> BucketCounts;
+		TArray<FBinnedCurveSegment>& BinnedSegments = Scratch.BinnedSegments;
+		TArray<int32>& BucketCounts = Scratch.BucketCounts;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.InitBuckets");
 			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
+			BinnedSegments.Reset(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
 			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
-			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
+			BucketCounts.SetNumZeroed(FMath::Max(1, Width), false);
 		}
 
 		{
@@ -371,7 +476,66 @@ namespace
 
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildGPUData");
-			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, ProcessedData.BucketRanges,
+			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, Scratch, ProcessedData.BucketRanges,
+			                             ProcessedData.LineData);
+		}
+
+		ProcessedData.bAcceptedInput = true;
+		return ProcessedData;
+	}
+
+	FIComputerProcessedCurveData BuildSimulatedCurveData(const FIComputerCurveRenderConfig& RenderConfig,
+	                                                     int32 Width, int32 Height, float Offset,
+	                                                     float Coefficient, float CurvePhaseStep,
+	                                                     FCurveProcessScratch& Scratch)
+	{
+		FIComputerProcessedCurveData ProcessedData;
+		ProcessedData.Width = Width;
+		ProcessedData.Height = Height;
+
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData");
+
+		const int32 SafeCurveCount = FMath::Max(1, RenderConfig.CurveCount);
+		const int32 SafeSampleCount = FMath::Max(2, RenderConfig.SampleCount);
+
+		FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+		ConfigForFrame.CurveCount = SafeCurveCount;
+		ConfigForFrame.SampleCount = SafeSampleCount;
+
+		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
+		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
+
+		TArray<FBinnedCurveSegment>& BinnedSegments = Scratch.BinnedSegments;
+		TArray<int32>& BucketCounts = Scratch.BucketCounts;
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.InitBuckets");
+			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
+			BinnedSegments.Reset(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
+			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
+			BucketCounts.SetNumZeroed(FMath::Max(1, Width), false);
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.BuildBuckets");
+			for (int32 CurveIndex = 0; CurveIndex < SafeCurveCount; ++CurveIndex)
+			{
+				const float BaseLine = ConfigForFrame.BaseLineStart +
+					static_cast<float>(CurveIndex) * ConfigForFrame.BaseLineStep;
+				const float CurveOffset = Offset + static_cast<float>(CurveIndex) * CurvePhaseStep;
+				FSineSampleGenerator SineGenerator(CurveOffset, Coefficient);
+				auto GetCurveSample = [&SineGenerator](int32 SourceIndex)
+				{
+					return SineGenerator.GetSample(SourceIndex);
+				};
+
+				AddCurveToBins(CurveIndex, SafeSampleCount, Width, BaseLine, ConfigForFrame.ValueScale,
+				               GetCurveSample, BinnedSegments, BucketCounts);
+			}
+		}
+
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.BuildGPUData");
+			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, Scratch, ProcessedData.BucketRanges,
 			                             ProcessedData.LineData);
 		}
 
@@ -396,12 +560,16 @@ namespace
 class FComputerCurveProcessWorker final : public FRunnable
 {
 public:
-	FComputerCurveProcessWorker(const TArray<TArray<float>>* InValuesPtr,
-	                            const FIComputerCurveRenderConfig* InConfigPtr,
+	FComputerCurveProcessWorker(const FIComputerCurveRenderConfig* InConfigPtr,
+	                            const float* InOffsetPtr,
+	                            const float* InCoefficientPtr,
+	                            const float* InCurvePhaseStepPtr,
 	                            FCriticalSection* InSourceCriticalSection,
 	                            int32 InWidth, int32 InHeight)
-		: ValuesPtr(InValuesPtr)
-		  , ConfigPtr(InConfigPtr)
+		: ConfigPtr(InConfigPtr)
+		  , OffsetPtr(InOffsetPtr)
+		  , CoefficientPtr(InCoefficientPtr)
+		  , CurvePhaseStepPtr(InCurvePhaseStepPtr)
 		  , Width(InWidth)
 		  , Height(InHeight)
 		  , SourceCriticalSection(InSourceCriticalSection)
@@ -435,30 +603,34 @@ public:
 			}
 			LastProcessedRequestCount = CurrentRequestCount;
 
-			TArray<TArray<float>> ValuesSnapshot;
 			FIComputerCurveRenderConfig ConfigSnapshot;
+			float OffsetSnapshot = 0.0f;
+			float CoefficientSnapshot = 1.0f;
+			float CurvePhaseStepSnapshot = 0.0f;
 			bool bHasInput = false;
 
-			if (ValuesPtr && ConfigPtr && SourceCriticalSection)
+			if (ConfigPtr && OffsetPtr && CoefficientPtr && CurvePhaseStepPtr && SourceCriticalSection)
 			{
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::SnapshotInput");
-				// 只在拷贝输入时加锁；真正耗时的 M4 降采样/分桶在锁外做，避免卡住 game thread 写入新波形。
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::SnapshotSimulationParams");
+				// 只复制轻量参数；正弦采样、M4 降采样和分桶都在锁外完成。
 				FScopeLock Lock(SourceCriticalSection);
-				if (ValuesPtr->Num() > 0)
-				{
-					ValuesSnapshot = *ValuesPtr;
-					ConfigSnapshot = *ConfigPtr;
-					bHasInput = true;
-				}
+				ConfigSnapshot = *ConfigPtr;
+				OffsetSnapshot = *OffsetPtr;
+				CoefficientSnapshot = *CoefficientPtr;
+				CurvePhaseStepSnapshot = *CurvePhaseStepPtr;
+				bHasInput = true;
 			}
 			if (bHasInput)
 			{
-				// BuildProcessedCurveData 是纯 CPU 工作：降采样、生成线段、按屏幕 x 分桶，不接触 UObject/RHI。
-				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
-					ValuesSnapshot,
+				// BuildSimulatedCurveData 是纯 CPU 工作：生成正弦样本、降采样、生成线段、按屏幕 x 分桶，不接触 UObject/RHI。
+				FIComputerProcessedCurveData Result = BuildSimulatedCurveData(
 					ConfigSnapshot,
 					Width,
-					Height
+					Height,
+					OffsetSnapshot,
+					CoefficientSnapshot,
+					CurvePhaseStepSnapshot,
+					Scratch
 				);
 
 				{
@@ -524,8 +696,10 @@ public:
 	}
 
 private:
-	const TArray<TArray<float>>* ValuesPtr = nullptr;
 	const FIComputerCurveRenderConfig* ConfigPtr = nullptr;
+	const float* OffsetPtr = nullptr;
+	const float* CoefficientPtr = nullptr;
+	const float* CurvePhaseStepPtr = nullptr;
 	int32 Width = 0;
 	int32 Height = 0;
 
@@ -536,6 +710,7 @@ private:
 
 	FCriticalSection ResultCriticalSection;
 	FIComputerProcessedCurveData CompletedResult;
+	FCurveProcessScratch Scratch;
 	FCriticalSection* SourceCriticalSection = nullptr;
 	bool bHasCompletedResult = false;
 };
@@ -546,19 +721,19 @@ AIComputerShaderObj::AIComputerShaderObj()
 	PrimaryActorTick.bStartWithTickEnabled = true;
 }
 
-TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
+TArray<FCurveSegmentGPU>* AIComputerShaderObj::TryGetWritableLineDataBuffer()
 {
 	// LineDataBuffers 是按需创建的三缓冲槽。每个槽保存一整帧 LineData，
 	// 后续可能被 render command 通过 SharedPtr 持有，所以不能随便覆盖。
 	auto EnsureBuffer = [](TSharedPtr<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>& Buffer)
-		-> TArray<FCurveSegmentGPU>&
+		-> TArray<FCurveSegmentGPU>*
 	{
 		if (!Buffer.IsValid())
 		{
 			Buffer = MakeShared<TArray<FCurveSegmentGPU>, ESPMode::ThreadSafe>();
 		}
 
-		return *Buffer;
+		return Buffer.Get();
 	};
 
 	auto IsBufferWritable = [this](int32 BufferIndex)
@@ -583,30 +758,11 @@ TArray<FCurveSegmentGPU>& AIComputerShaderObj::GetWritableLineDataBuffer()
 		}
 	}
 
-	// 三个槽都不可写时，当前实现选择等待一个非 ready 槽完成，保证数据正确但可能造成 game thread 卡顿。
-	// 如果要进一步优化实时波形，可以把这里改成“拿不到可写槽就丢掉本帧结果”。
+	// 三个槽都不可写时，丢掉本帧 CPU 结果，避免 Game Thread 等待 render thread fence。
 	if (!IsBufferWritable(LineDataWriteBufferIndex))
 	{
-		int32 WaitBufferIndex = INDEX_NONE;
-		for (int32 BufferIndex = 0; BufferIndex < LineDataUploadBufferCount; ++BufferIndex)
-		{
-			if (BufferIndex != LineDataReadyBufferIndex)
-			{
-				WaitBufferIndex = BufferIndex;
-				break;
-			}
-		}
-
-		if (WaitBufferIndex == INDEX_NONE)
-		{
-			WaitBufferIndex = LineDataWriteBufferIndex;
-		}
-
-		{
-			LineDataUploadFences[WaitBufferIndex].Wait();
-		}
-
-		LineDataWriteBufferIndex = WaitBufferIndex;
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::TryGetWritableLineDataBuffer.DropFrame");
+		return nullptr;
 	}
 
 	return EnsureBuffer(LineDataBuffers[LineDataWriteBufferIndex]);
@@ -627,25 +783,33 @@ void AIComputerShaderObj::ResetCurveDataToSafeBuffers(int32 Width, int32 Height,
 	FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
 	ConfigForFrame.CurveCount = FMath::Max(1, CurveCount);
 
-	TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
-	ResetCurveBuffers(Width, Height, ConfigForFrame, LineDrawDesc, WritableLineData, BucketRanges, CurveColors);
-	MarkLineDataReadyForUpload();
+	if (TArray<FCurveSegmentGPU>* WritableLineData = TryGetWritableLineDataBuffer())
+	{
+		ResetCurveBuffers(Width, Height, ConfigForFrame, LineDrawDesc, *WritableLineData, BucketRanges, CurveColors);
+		MarkLineDataReadyForUpload();
+	}
 }
 
-void AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData)
+bool AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData)
 {
+	TArray<FCurveSegmentGPU>* WritableLineData = TryGetWritableLineDataBuffer();
+	if (!WritableLineData)
+	{
+		return false;
+	}
+
 	LineDrawDesc = MoveTemp(ProcessedData.LineDrawDesc);
 	BucketRanges = MoveTemp(ProcessedData.BucketRanges);
 	CurveColors = MoveTemp(ProcessedData.CurveColors);
 
-	TArray<FCurveSegmentGPU>& WritableLineData = GetWritableLineDataBuffer();
-	WritableLineData = MoveTemp(ProcessedData.LineData);
-	if (WritableLineData.Num() == 0)
+	*WritableLineData = MoveTemp(ProcessedData.LineData);
+	if (WritableLineData->Num() == 0)
 	{
-		WritableLineData.AddZeroed(1);
+		WritableLineData->AddZeroed(1);
 	}
 
 	MarkLineDataReadyForUpload();
+	return true;
 }
 
 bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 Height)
@@ -666,8 +830,7 @@ bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 He
 		return false;
 	}
 
-	ApplyProcessedCurveData(MoveTemp(ProcessedData));
-	return true;
+	return ApplyProcessedCurveData(MoveTemp(ProcessedData));
 }
 
 void AIComputerShaderObj::ShutdownCurveProcessWorker()
@@ -710,9 +873,15 @@ void AIComputerShaderObj::BeginPlay()
 
 	if (!CurveProcessWorker)
 	{
-		CurveProcessWorker = new FComputerCurveProcessWorker(&SimulatedCurveValues, &RenderConfig,
-		                                                     &SimulatedCurveValuesCriticalSection, WorkerWidth,
-		                                                     WorkerHeight);
+		CurveProcessWorker = new FComputerCurveProcessWorker(
+			&RenderConfig,
+			&SimulatedRunningPhase,
+			&SimulatedSinCoefficient,
+			&SimulatedCurvePhaseStep,
+			&SimulationStateCriticalSection,
+			WorkerWidth,
+			WorkerHeight
+		);
 	}
 	CurveProcessWorker->RequestWork();
 }
@@ -723,14 +892,12 @@ void AIComputerShaderObj::Tick(float DeltaSeconds)
 
 	UploadTickAccumulatorSeconds += DeltaSeconds;
 
-	//30hz运行速度
 	if (UploadTickAccumulatorSeconds >= 0.033f)
 	{
-		UploadTickAccumulatorSeconds -= 0.033f;
-		// SetMultiSinWaveData 的 offset 是弧度；持续推进相位后，CPU 采样数据会变化，后台 worker 会处理出新的线段。
+		//30hz运行速度
 		SimulatedRunningPhase = FMath::Fmod(SimulatedRunningPhase + DeltaSeconds * SimulatedScrollSpeed, 2.0f * PI);
 		SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
-
+		UploadTickAccumulatorSeconds -= 0.033f;
 		UploadProcessedCurveDataToGPU();
 	}
 }
@@ -760,7 +927,7 @@ void AIComputerShaderObj::Execute()
 void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
 {
 	{
-		FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
+		FScopeLock Lock(&SimulationStateCriticalSection);
 		RenderConfig = InConfig;
 	}
 
@@ -830,14 +997,15 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 		}
 		LineDrawDescCopy[0] = static_cast<float>(Width);
 		LineDrawDescCopy[1] = static_cast<float>(Height);
-		LineDrawDescCopy[2] = 0.0f;
+		LineDrawDescCopy[2] = static_cast<float>(FMath::DivideAndRoundUp(FMath::Max(1, Height), GTileHeight));
 	}
 
 	TArray<uint32> BucketRangesCopy;
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyBucketRanges");
 		BucketRangesCopy = BucketRanges;
-		const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * GBucketRangeUintCount;
+		const int32 TileCountY = FMath::DivideAndRoundUp(FMath::Max(1, Height), GTileHeight);
+		const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * TileCountY * GBucketRangeUintCount;
 		if (BucketRangesCopy.Num() != ExpectedBucketRangeCount)
 		{
 			BucketRangesCopy.SetNumZeroed(ExpectedBucketRangeCount);
@@ -941,8 +1109,10 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 				}
 
 				{
+					RDG_EVENT_SCOPE(GraphBuilder, "IComputerShader Dispatch");
+					RDG_GPU_STAT_SCOPE(GraphBuilder, IComputerShaderDispatch);
 					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("AIComputerShaderObj::UploadProcessedCurveDataToGPU.Dispatch"),
+						RDG_EVENT_NAME("IComputerShader Dispatch"),
 						PassParameters,
 						ERDGPassFlags::AsyncCompute,
 						[ComputeShader, PassParameters, GroupCount](FRHIComputeCommandList& RHICmdList)
@@ -971,32 +1141,12 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
 {
 	{
-		FScopeLock Lock(&SimulatedCurveValuesCriticalSection);
+		FScopeLock Lock(&SimulationStateCriticalSection);
 
 		// 记录最近一次模拟参数，Tick 推进相位时会沿用它们继续生成后续帧。
 		SimulatedRunningPhase = offset;
 		SimulatedSinCoefficient = coefficient;
 		SimulatedCurvePhaseStep = curvePhaseStep;
-
-		const int32 CurveCount = FMath::Max(1, RenderConfig.CurveCount);
-		const int32 SampleCount = FMath::Max(2, RenderConfig.SampleCount);
-
-		// 临时 sin 模拟数据直接复用 SimulatedCurveValues 的已有容量，避免每帧创建/搬移 NewCurveValues。
-		// 这里必须持锁写完整帧，防止 worker snapshot 到写了一半的曲线数据。
-		SimulatedCurveValues.SetNum(CurveCount, false);
-
-		for (int32 CurveIndex = 0; CurveIndex < CurveCount; ++CurveIndex)
-		{
-			TArray<float>& CurveSamples = SimulatedCurveValues[CurveIndex];
-			CurveSamples.SetNumUninitialized(SampleCount, false);
-
-			const float CurveOffset = offset + static_cast<float>(CurveIndex) * curvePhaseStep;
-			for (int32 SourceIndex = 0; SourceIndex < SampleCount; ++SourceIndex)
-			{
-				CurveSamples[SourceIndex] =
-					FMath::Sin(FMath::DegreesToRadians(SourceIndex * coefficient) + CurveOffset);
-			}
-		}
 	}
 
 	if (CurveProcessWorker)
@@ -1009,13 +1159,14 @@ bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
 {
 	const int32 Width = RenderTarget ? RenderTarget->SizeX : 1024;
 	const int32 Height = RenderTarget ? RenderTarget->SizeY : 1024;
+	FCurveProcessScratch Scratch;
 	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
 		Values,
 		RenderConfig,
 		Width,
-		Height
+		Height,
+		Scratch
 	);
 	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
-	ApplyProcessedCurveData(MoveTemp(ProcessedData));
-	return bAcceptedInput;
+	return bAcceptedInput && ApplyProcessedCurveData(MoveTemp(ProcessedData));
 }

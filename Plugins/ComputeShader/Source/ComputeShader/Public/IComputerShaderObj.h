@@ -88,15 +88,14 @@ public:
 	// 将 ProcessCurveData 生成的最终结果上传到 GPU，并执行 compute shader。
 	void UploadProcessedCurveDataToGPU();
 
-	// 临时正弦波数据源模拟入口：生成 CurveCount 条曲线，每条曲线包含 SampleCount 个原始样本。
-	// 生成结果复用内部 SimulatedCurveValues 缓存，然后走二维数组版本的 ProcessCurveData。
+	// 临时正弦波数据源模拟入口：只更新模拟参数；真正的正弦采样与 CPU 预处理在后台 worker 中完成。
 	void SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep);
 
 private:
-	TArray<FCurveSegmentGPU>& GetWritableLineDataBuffer();
+	TArray<FCurveSegmentGPU>* TryGetWritableLineDataBuffer();
 	void MarkLineDataReadyForUpload();
 	void ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount);
-	void ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData);
+	bool ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData);
 	bool TryApplyWorkerCurveProcessResult(int32 Width, int32 Height);
 	void ShutdownCurveProcessWorker();
 
@@ -128,11 +127,8 @@ private:
 	enum { LineDataUploadBufferCount = 3 };
 
 	TArray<float> LineDrawDesc;
-	// SetMultiSinWaveData 专用的模拟原始数据缓存，布局为 [CurveIndex][SourceIndex]。
-	// 不标记 UPROPERTY：UE 反射不支持 TArray<TArray<float>>，这里也不需要暴露给蓝图。
-	TArray<TArray<float>> SimulatedCurveValues;
-	// 保护 SimulatedCurveValues 与 RenderConfig 的并发访问（game thread 写，worker thread 读）。
-	mutable FCriticalSection SimulatedCurveValuesCriticalSection;
+	// 保护 RenderConfig 与模拟参数的并发访问（game thread 写，worker thread 读）。
+	mutable FCriticalSection SimulationStateCriticalSection;
 	float SimulatedRunningPhase = 0.0f;
 	FComputerCurveProcessWorker* CurveProcessWorker = nullptr;
 	int32 WorkerWidth = 0;

@@ -16,6 +16,7 @@ StructuredBuffer<FCurveSegment> LineData;
 Buffer<uint> BucketRanges;
 Buffer<float4> CurveColors;
 
+#define TILE_HEIGHT 64
 
 float DistanceToSegment(float2 Pixel, float2 Start, float2 End)
 {
@@ -35,7 +36,6 @@ void AccumulateSegmentDistance(
 	uint CurveIndex,
 	float BoundsExpand)
 {
-	// X 方向已经由 CPU 端按 bucket 预筛过，这里只做 Y 方向剔除。
 	float MinY = min(SegmentStart.y, SegmentEnd.y) - BoundsExpand;
 	float MaxY = max(SegmentStart.y, SegmentEnd.y) + BoundsExpand;
 	if (Pixel.y < MinY || Pixel.y > MaxY)
@@ -62,6 +62,7 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
+	uint TileCountY = max(uint(LineDrawDesc[2]), 1u);
 	uint CurveCount = max(uint(LineDrawDesc[3]), 1u);
 	float LineWidth = 1.0f;
 	float HalfWidth = LineWidth * 0.5f;
@@ -79,8 +80,9 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 	uint BestCurveIndex = 0u;
 	float BoundsExpand = HalfWidth + AntiAliasWidth;
 
-	// 整个 warp 共享同一个 x bucket，下面的 SegmentOffset/Count 实质是常量广播。
-	uint RangeBase = PixelCoord.x * 2u;
+	uint YTile = PixelCoord.y / TILE_HEIGHT;
+	uint CellIndex = PixelCoord.x * TileCountY + YTile;
+	uint RangeBase = CellIndex * 2u;
 	uint SegmentOffset = BucketRanges[RangeBase];
 	uint SegmentCount = BucketRanges[RangeBase + 1u];
 
@@ -94,7 +96,6 @@ void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 	}
 
 	float Alpha = 1.0f - smoothstep(HalfWidth, HalfWidth + AntiAliasWidth, MinDistance);
-	//float Alpha = MinDistance <= HalfWidth ? 1.0f : 0.0f;
 
 	float4 BackgroundColor = float4(0.0f, 0.0f, 0.5f, 0.5f);
 	float4 LineColor = LoadCurveColor(BestCurveIndex, CurveCount);
