@@ -51,14 +51,6 @@ namespace
 		int32 EndBucket = 0;
 	};
 
-	struct FCurveProcessScratch
-	{
-		TArray<FBinnedCurveSegment> BinnedSegments;
-		TArray<int32> BucketCounts;
-		TArray<int32> CellCounts;
-		TArray<uint32> CellWriteOffsets;
-	};
-
 	struct FSineSampleGenerator
 	{
 		explicit FSineSampleGenerator(float InOffset, float InCoefficientDegrees)
@@ -320,7 +312,6 @@ namespace
 	// BucketRanges[(x * TileCountY + yTile) * 2 + 0/1] = offset, count in OutLineData.
 	void BuildBucketRangesAndLineData(const TArray<FBinnedCurveSegment>& BinnedSegments,
 	                                  const TArray<int32>& BucketCounts, int32 Height,
-	                                  FCurveProcessScratch& Scratch,
 	                                  TArray<uint32>& OutBucketRanges,
 	                                  TArray<FCurveSegmentGPU>& OutLineData)
 	{
@@ -330,8 +321,8 @@ namespace
 		const float TileExpand = GBinningExpand + 1.5f;
 
 		// First pass: count segments per (x, yTile) cell.
-		TArray<int32>& CellCounts = Scratch.CellCounts;
-		CellCounts.SetNumZeroed(TotalCells, false);
+		TArray<int32> CellCounts;
+		CellCounts.SetNumZeroed(TotalCells);
 
 		for (const FBinnedCurveSegment& BinnedSegment : BinnedSegments)
 		{
@@ -352,8 +343,8 @@ namespace
 
 		// Build offsets
 		OutBucketRanges.SetNumUninitialized(TotalCells * GBucketRangeUintCount);
-		TArray<uint32>& CellWriteOffsets = Scratch.CellWriteOffsets;
-		CellWriteOffsets.SetNumUninitialized(TotalCells, false);
+		TArray<uint32> CellWriteOffsets;
+		CellWriteOffsets.SetNumUninitialized(TotalCells);
 		int32 TotalSegmentCount = 0;
 
 		for (int32 CellIndex = 0; CellIndex < TotalCells; ++CellIndex)
@@ -403,8 +394,7 @@ namespace
 
 	FIComputerProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
 	                                                     const FIComputerCurveRenderConfig& RenderConfig,
-	                                                     int32 Width, int32 Height,
-	                                                     FCurveProcessScratch& Scratch)
+	                                                     int32 Width, int32 Height)
 	{
 		FIComputerProcessedCurveData ProcessedData;
 		ProcessedData.Width = Width;
@@ -446,14 +436,13 @@ namespace
 		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
 		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
 
-		TArray<FBinnedCurveSegment>& BinnedSegments = Scratch.BinnedSegments;
-		TArray<int32>& BucketCounts = Scratch.BucketCounts;
+		TArray<FBinnedCurveSegment> BinnedSegments;
+		TArray<int32> BucketCounts;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.InitBuckets");
 			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
-			BinnedSegments.Reset(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
 			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
-			BucketCounts.SetNumZeroed(FMath::Max(1, Width), false);
+			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
 		}
 
 		{
@@ -476,7 +465,7 @@ namespace
 
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildGPUData");
-			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, Scratch, ProcessedData.BucketRanges,
+			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, ProcessedData.BucketRanges,
 			                             ProcessedData.LineData);
 		}
 
@@ -486,8 +475,7 @@ namespace
 
 	FIComputerProcessedCurveData BuildSimulatedCurveData(const FIComputerCurveRenderConfig& RenderConfig,
 	                                                     int32 Width, int32 Height, float Offset,
-	                                                     float Coefficient, float CurvePhaseStep,
-	                                                     FCurveProcessScratch& Scratch)
+	                                                     float Coefficient, float CurvePhaseStep)
 	{
 		FIComputerProcessedCurveData ProcessedData;
 		ProcessedData.Width = Width;
@@ -505,14 +493,13 @@ namespace
 		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
 		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
 
-		TArray<FBinnedCurveSegment>& BinnedSegments = Scratch.BinnedSegments;
-		TArray<int32>& BucketCounts = Scratch.BucketCounts;
+		TArray<FBinnedCurveSegment> BinnedSegments;
+		TArray<int32> BucketCounts;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.InitBuckets");
 			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
-			BinnedSegments.Reset(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
 			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
-			BucketCounts.SetNumZeroed(FMath::Max(1, Width), false);
+			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
 		}
 
 		{
@@ -535,7 +522,7 @@ namespace
 
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.BuildGPUData");
-			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, Scratch, ProcessedData.BucketRanges,
+			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, ProcessedData.BucketRanges,
 			                             ProcessedData.LineData);
 		}
 
@@ -629,8 +616,7 @@ public:
 					Height,
 					OffsetSnapshot,
 					CoefficientSnapshot,
-					CurvePhaseStepSnapshot,
-					Scratch
+					CurvePhaseStepSnapshot
 				);
 
 				{
@@ -710,7 +696,6 @@ private:
 
 	FCriticalSection ResultCriticalSection;
 	FIComputerProcessedCurveData CompletedResult;
-	FCurveProcessScratch Scratch;
 	FCriticalSection* SourceCriticalSection = nullptr;
 	bool bHasCompletedResult = false;
 };
@@ -1159,13 +1144,11 @@ bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
 {
 	const int32 Width = RenderTarget ? RenderTarget->SizeX : 1024;
 	const int32 Height = RenderTarget ? RenderTarget->SizeY : 1024;
-	FCurveProcessScratch Scratch;
 	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
 		Values,
 		RenderConfig,
 		Width,
-		Height,
-		Scratch
+		Height
 	);
 	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
 	return bAcceptedInput && ApplyProcessedCurveData(MoveTemp(ProcessedData));
