@@ -1,6 +1,6 @@
-﻿#include "IComputerShaderObj.h"
+#include "ExtremeValueSampleActor.h"
 
-#include "IComputerShader.h"
+#include "ExtremeValueSampleShader.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/Event.h"
@@ -13,9 +13,9 @@
 #include "RenderGraphEvent.h"
 #include "RenderGraphUtils.h"
 
-class FIComputerShader;
+class FExtremeValueSampleShader;
 
-DECLARE_GPU_STAT_NAMED(IComputerShaderDispatch, TEXT("IComputerShader Dispatch"));
+DECLARE_GPU_STAT_NAMED(ExtremeValueSampleShaderDispatch, TEXT("ExtremeValueSampleShader Dispatch"));
 
 namespace
 {
@@ -49,10 +49,10 @@ namespace
 		int32 EndBucket = 0;
 	};
 
-	struct FComputerCurveProcessInput
+	struct FExtremeValueCurveProcessInput
 	{
 		uint64 RequestId = 0;
-		FIComputerCurveRenderConfig RenderConfig;
+		FExtremeValueCurveRenderConfig RenderConfig;
 		TArray<TArray<float>> Values;
 	};
 
@@ -137,7 +137,7 @@ namespace
 	}
 
 	// Builds the compact color table uploaded to the shader, one color per curve.
-	void BuildCurveColors(const FIComputerCurveRenderConfig& Config, TArray<FLinearColor>& OutCurveColors)
+	void BuildCurveColors(const FExtremeValueCurveRenderConfig& Config, TArray<FLinearColor>& OutCurveColors)
 	{
 		const int32 CurveCount = FMath::Max(1, Config.CurveCount);
 		OutCurveColors.Reset(CurveCount);
@@ -159,7 +159,7 @@ namespace
 	}
 
 	// Creates safe non-empty buffers for initialization and invalid input cases.
-	void ResetCurveBuffers(int32 Width, int32 Height, const FIComputerCurveRenderConfig& Config,
+	void ResetCurveBuffers(int32 Width, int32 Height, const FExtremeValueCurveRenderConfig& Config,
 	                       TArray<float>& OutLineDrawDesc, TArray<FCurveSegmentGPU>& OutLineData,
 	                       TArray<uint32>& OutBucketRanges, TArray<FLinearColor>& OutCurveColors)
 	{
@@ -397,11 +397,11 @@ namespace
 		}
 	}
 
-	FIComputerProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
-	                                                     const FIComputerCurveRenderConfig& RenderConfig,
+	FExtremeValueProcessedCurveData BuildProcessedCurveData(const TArray<TArray<float>>& Values,
+	                                                     const FExtremeValueCurveRenderConfig& RenderConfig,
 	                                                     int32 Width, int32 Height)
 	{
-		FIComputerProcessedCurveData ProcessedData;
+		FExtremeValueProcessedCurveData ProcessedData;
 		ProcessedData.Width = Width;
 		ProcessedData.Height = Height;
 
@@ -410,7 +410,7 @@ namespace
 
 		if (CurveCount <= 0)
 		{
-			FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+			FExtremeValueCurveRenderConfig ConfigForFrame = RenderConfig;
 			ConfigForFrame.CurveCount = 1;
 			ResetCurveBuffers(Width, Height, ConfigForFrame, ProcessedData.LineDrawDesc, ProcessedData.LineData,
 			                  ProcessedData.BucketRanges, ProcessedData.CurveColors);
@@ -421,7 +421,7 @@ namespace
 		{
 			if (CurveSamples.Num() < SampleCount)
 			{
-				FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+				FExtremeValueCurveRenderConfig ConfigForFrame = RenderConfig;
 				ConfigForFrame.CurveCount = CurveCount;
 				ResetCurveBuffers(Width, Height, ConfigForFrame, ProcessedData.LineDrawDesc, ProcessedData.LineData,
 				                  ProcessedData.BucketRanges, ProcessedData.CurveColors);
@@ -429,12 +429,12 @@ namespace
 			}
 		}
 
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::ProcessCurveData");
 
 		const int32 SafeCurveCount = FMath::Max(1, CurveCount);
 		const int32 SafeSampleCount = FMath::Max(2, SampleCount);
 
-		FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+		FExtremeValueCurveRenderConfig ConfigForFrame = RenderConfig;
 		ConfigForFrame.CurveCount = SafeCurveCount;
 		ConfigForFrame.SampleCount = SafeSampleCount;
 
@@ -444,14 +444,14 @@ namespace
 		TArray<FBinnedCurveSegment> BinnedSegments;
 		TArray<int32> BucketCounts;
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.InitBuckets");
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::ProcessCurveData.InitBuckets");
 			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
 			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
 			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
 		}
 
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildBuckets");
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::ProcessCurveData.BuildBuckets");
 			for (int32 CurveIndex = 0; CurveIndex < SafeCurveCount; ++CurveIndex)
 			{
 				const float BaseLine = ConfigForFrame.BaseLineStart +
@@ -469,7 +469,7 @@ namespace
 		}
 
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessCurveData.BuildGPUData");
+			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::ProcessCurveData.BuildGPUData");
 			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, ProcessedData.BucketRanges,
 			                             ProcessedData.LineData);
 		}
@@ -478,10 +478,10 @@ namespace
 		return ProcessedData;
 	}
 
-	TArray<TArray<float>> BuildSimulatedCurveSamples(const FIComputerCurveRenderConfig& RenderConfig,
+	TArray<TArray<float>> BuildSimulatedCurveSamples(const FExtremeValueCurveRenderConfig& RenderConfig,
 	                                                 float Offset, float Coefficient, float CurvePhaseStep)
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::BuildSimulatedCurveSamples");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::BuildSimulatedCurveSamples");
 
 		const int32 SafeCurveCount = FMath::Max(1, RenderConfig.CurveCount);
 		const int32 SafeSampleCount = FMath::Max(2, RenderConfig.SampleCount);
@@ -505,9 +505,9 @@ namespace
 	}
 
 	// Legacy SetSinWaveData defaults: one 5000-sample curve, caller-provided baseline, default color.
-	FIComputerCurveRenderConfig MakeLegacyConfig(float BaseLineHeight)
+	FExtremeValueCurveRenderConfig MakeLegacyConfig(float BaseLineHeight)
 	{
-		FIComputerCurveRenderConfig Config;
+		FExtremeValueCurveRenderConfig Config;
 		Config.CurveCount = 1;
 		Config.SampleCount = GLegacySourceCount;
 		Config.BaseLineStart = BaseLineHeight;
@@ -518,19 +518,19 @@ namespace
 	}
 }
 
-class FComputerCurveProcessWorker final : public FRunnable
+class FExtremeValueCurveProcessWorker final : public FRunnable
 {
 public:
-	FComputerCurveProcessWorker(int32 InWidth, int32 InHeight)
+	FExtremeValueCurveProcessWorker(int32 InWidth, int32 InHeight)
 		: Width(InWidth)
 		  , Height(InHeight)
 	{
 		// 后台线程只负责 CPU 侧预处理：把外部准备好的 raw samples 转换成 shader 可直接消费的线段/bucket buffer。
 		WorkEvent = FPlatformProcess::GetSynchEventFromPool(false);
-		Thread = FRunnableThread::Create(this, TEXT("IComputerShader_CurveProcessWorker"), 0, TPri_BelowNormal);
+		Thread = FRunnableThread::Create(this, TEXT("ExtremeValueSampleShader_CurveProcessWorker"), 0, TPri_BelowNormal);
 	}
 
-	virtual ~FComputerCurveProcessWorker() override
+	virtual ~FExtremeValueCurveProcessWorker() override
 	{
 		Shutdown();
 	}
@@ -545,7 +545,7 @@ public:
 				break;
 			}
 
-			FComputerCurveProcessInput Input;
+			FExtremeValueCurveProcessInput Input;
 			bool bHasInput = false;
 
 			{
@@ -562,7 +562,7 @@ public:
 			if (bHasInput)
 			{
 				// BuildProcessedCurveData 是纯 CPU 工作：M4 极值采样、生成线段、按屏幕 x/y tile 分桶，不接触 UObject/RHI。
-				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
+				FExtremeValueProcessedCurveData Result = BuildProcessedCurveData(
 					Input.Values,
 					Input.RenderConfig,
 					Width,
@@ -591,7 +591,7 @@ public:
 		}
 	}
 
-	void RequestWork(FComputerCurveProcessInput&& Input)
+	void RequestWork(FExtremeValueCurveProcessInput&& Input)
 	{
 		{
 			FScopeLock Lock(&InputCriticalSection);
@@ -605,7 +605,7 @@ public:
 		}
 	}
 
-	bool DequeueResult(FIComputerProcessedCurveData& OutResult, uint64& OutRequestId)
+	bool DequeueResult(FExtremeValueProcessedCurveData& OutResult, uint64& OutRequestId)
 	{
 		FScopeLock Lock(&ResultCriticalSection);
 		if (!bHasCompletedResult)
@@ -648,22 +648,22 @@ private:
 	FThreadSafeBool bStopRequested = false;
 
 	FCriticalSection InputCriticalSection;
-	FComputerCurveProcessInput PendingInput;
+	FExtremeValueCurveProcessInput PendingInput;
 	bool bHasPendingInput = false;
 
 	FCriticalSection ResultCriticalSection;
-	FIComputerProcessedCurveData CompletedResult;
+	FExtremeValueProcessedCurveData CompletedResult;
 	uint64 CompletedResultRequestId = 0;
 	bool bHasCompletedResult = false;
 };
 
-AIComputerShaderObj::AIComputerShaderObj()
+AExtremeValueSampleActor::AExtremeValueSampleActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true;
 }
 
-TArray<FCurveSegmentGPU>* AIComputerShaderObj::TryGetWritableLineDataBuffer()
+TArray<FCurveSegmentGPU>* AExtremeValueSampleActor::TryGetWritableLineDataBuffer()
 {
 	// LineDataBuffers 是按需创建的三缓冲槽。每个槽保存一整帧 LineData，
 	// 后续可能被 render command 通过 SharedPtr 持有，所以不能随便覆盖。
@@ -703,14 +703,14 @@ TArray<FCurveSegmentGPU>* AIComputerShaderObj::TryGetWritableLineDataBuffer()
 	// 三个槽都不可写时，丢掉本帧 CPU 结果，避免 Game Thread 等待 render thread fence。
 	if (!IsBufferWritable(LineDataWriteBufferIndex))
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::TryGetWritableLineDataBuffer.DropFrame");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::TryGetWritableLineDataBuffer.DropFrame");
 		return nullptr;
 	}
 
 	return EnsureBuffer(LineDataBuffers[LineDataWriteBufferIndex]);
 }
 
-void AIComputerShaderObj::MarkLineDataReadyForUpload()
+void AExtremeValueSampleActor::MarkLineDataReadyForUpload()
 {
 	// 当前 WriteIndex 已经填入一帧完整 LineData：
 	// - 先把它发布成 ready 槽，等待 UploadProcessedCurveDataToGPU 取走。
@@ -720,9 +720,9 @@ void AIComputerShaderObj::MarkLineDataReadyForUpload()
 	LineDataWriteBufferIndex = (LineDataWriteBufferIndex + 1) % LineDataUploadBufferCount;
 }
 
-void AIComputerShaderObj::ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount)
+void AExtremeValueSampleActor::ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount)
 {
-	FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
+	FExtremeValueCurveRenderConfig ConfigForFrame = RenderConfig;
 	ConfigForFrame.CurveCount = FMath::Max(1, CurveCount);
 
 	if (TArray<FCurveSegmentGPU>* WritableLineData = TryGetWritableLineDataBuffer())
@@ -732,7 +732,7 @@ void AIComputerShaderObj::ResetCurveDataToSafeBuffers(int32 Width, int32 Height,
 	}
 }
 
-bool AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData)
+bool AExtremeValueSampleActor::ApplyProcessedCurveData(FExtremeValueProcessedCurveData&& ProcessedData)
 {
 	TArray<FCurveSegmentGPU>* WritableLineData = TryGetWritableLineDataBuffer();
 	if (!WritableLineData)
@@ -754,14 +754,14 @@ bool AIComputerShaderObj::ApplyProcessedCurveData(FIComputerProcessedCurveData&&
 	return true;
 }
 
-bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 Height)
+bool AExtremeValueSampleActor::TryApplyWorkerCurveProcessResult(int32 Width, int32 Height)
 {
 	if (!CurveProcessWorker)
 	{
 		return false;
 	}
 
-	FIComputerProcessedCurveData ProcessedData;
+	FExtremeValueProcessedCurveData ProcessedData;
 	uint64 ResultRequestId = 0;
 	if (!CurveProcessWorker->DequeueResult(ProcessedData, ResultRequestId))
 	{
@@ -786,12 +786,12 @@ bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 He
 	return bApplied;
 }
 
-bool AIComputerShaderObj::ProcessCurveDataOnGameThread(const TArray<TArray<float>>& Values,
-                                                       const FIComputerCurveRenderConfig& ConfigSnapshot)
+bool AExtremeValueSampleActor::ProcessCurveDataOnGameThread(const TArray<TArray<float>>& Values,
+                                                       const FExtremeValueCurveRenderConfig& ConfigSnapshot)
 {
 	const int32 Width = RenderTarget ? RenderTarget->SizeX : RenderTargetWidth;
 	const int32 Height = RenderTarget ? RenderTarget->SizeY : RenderTargetHeight;
-	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
+	FExtremeValueProcessedCurveData ProcessedData = BuildProcessedCurveData(
 		Values,
 		ConfigSnapshot,
 		Width,
@@ -802,8 +802,8 @@ bool AIComputerShaderObj::ProcessCurveDataOnGameThread(const TArray<TArray<float
 	return bAcceptedInput && ApplyProcessedCurveData(MoveTemp(ProcessedData));
 }
 
-void AIComputerShaderObj::QueueCurveDataForWorker(TArray<TArray<float>>&& Values,
-                                                  const FIComputerCurveRenderConfig& ConfigSnapshot)
+void AExtremeValueSampleActor::QueueCurveDataForWorker(TArray<TArray<float>>&& Values,
+                                                  const FExtremeValueCurveRenderConfig& ConfigSnapshot)
 {
 	const uint64 RequestId = ++NextCurveProcessRequestId;
 
@@ -817,16 +817,16 @@ void AIComputerShaderObj::QueueCurveDataForWorker(TArray<TArray<float>>&& Values
 		return;
 	}
 
-	FComputerCurveProcessInput Input;
+	FExtremeValueCurveProcessInput Input;
 	Input.RequestId = RequestId;
 	Input.RenderConfig = ConfigSnapshot;
 	Input.Values = MoveTemp(Values);
 	CurveProcessWorker->RequestWork(MoveTemp(Input));
 }
 
-void AIComputerShaderObj::QueueSimulatedCurveDataForWorker()
+void AExtremeValueSampleActor::QueueSimulatedCurveDataForWorker()
 {
-	FIComputerCurveRenderConfig ConfigSnapshot = RenderConfig;
+	FExtremeValueCurveRenderConfig ConfigSnapshot = RenderConfig;
 	ConfigSnapshot.CurveCount = FMath::Max(1, ConfigSnapshot.CurveCount);
 	ConfigSnapshot.SampleCount = FMath::Max(2, ConfigSnapshot.SampleCount);
 
@@ -840,7 +840,7 @@ void AIComputerShaderObj::QueueSimulatedCurveDataForWorker()
 	QueueCurveDataForWorker(MoveTemp(SimulatedSamples), ConfigSnapshot);
 }
 
-void AIComputerShaderObj::ShutdownCurveProcessWorker()
+void AExtremeValueSampleActor::ShutdownCurveProcessWorker()
 {
 	if (CurveProcessWorker)
 	{
@@ -849,7 +849,7 @@ void AIComputerShaderObj::ShutdownCurveProcessWorker()
 	}
 }
 
-void AIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
+void AExtremeValueSampleActor::CreateRenderTarget(int32 Width, int32 Height)
 {
 	RenderTargetWidth = FMath::Max(1, Width);
 	RenderTargetHeight = FMath::Max(1, Height);
@@ -863,7 +863,7 @@ void AIComputerShaderObj::CreateRenderTarget(int32 Width, int32 Height)
 	ResetCurveDataToSafeBuffers(RenderTargetWidth, RenderTargetHeight, RenderConfig.CurveCount);
 }
 
-void AIComputerShaderObj::BeginPlay()
+void AExtremeValueSampleActor::BeginPlay()
 {
 	Super::BeginPlay();
 
@@ -879,13 +879,13 @@ void AIComputerShaderObj::BeginPlay()
 
 	if (!CurveProcessWorker)
 	{
-		CurveProcessWorker = new FComputerCurveProcessWorker(WorkerWidth, WorkerHeight);
+		CurveProcessWorker = new FExtremeValueCurveProcessWorker(WorkerWidth, WorkerHeight);
 	}
 
 	SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
 }
 
-void AIComputerShaderObj::Tick(float DeltaSeconds)
+void AExtremeValueSampleActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
@@ -904,29 +904,29 @@ void AIComputerShaderObj::Tick(float DeltaSeconds)
 	}
 }
 
-void AIComputerShaderObj::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void AExtremeValueSampleActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	ShutdownCurveProcessWorker();
 	Super::EndPlay(EndPlayReason);
 }
 
-void AIComputerShaderObj::BeginDestroy()
+void AExtremeValueSampleActor::BeginDestroy()
 {
 	ShutdownCurveProcessWorker();
 	Super::BeginDestroy();
 }
 
-UTextureRenderTarget2D* AIComputerShaderObj::GetRenderTarget() const
+UTextureRenderTarget2D* AExtremeValueSampleActor::GetRenderTarget() const
 {
 	return RenderTarget;
 }
 
-void AIComputerShaderObj::Execute()
+void AExtremeValueSampleActor::Execute()
 {
 	UploadProcessedCurveDataToGPU();
 }
 
-void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
+void AExtremeValueSampleActor::SetRenderConfig(const FExtremeValueCurveRenderConfig& InConfig)
 {
 	RenderConfig = InConfig;
 
@@ -942,14 +942,14 @@ void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InC
 	}
 }
 
-FIComputerCurveRenderConfig AIComputerShaderObj::GetRenderConfig() const
+FExtremeValueCurveRenderConfig AExtremeValueSampleActor::GetRenderConfig() const
 {
 	return RenderConfig;
 }
 
-void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
+void AExtremeValueSampleActor::UploadProcessedCurveDataToGPU()
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU");
+	TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::UploadProcessedCurveDataToGPU");
 
 	if (!RenderTarget)
 	{
@@ -1007,7 +1007,7 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	TArray<uint32> BucketRangesCopy;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyBucketRanges");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::UploadProcessedCurveDataToGPU.CopyBucketRanges");
 		BucketRangesCopy = BucketRanges;
 		const int32 TileCountY = FMath::DivideAndRoundUp(FMath::Max(1, Height), GTileHeight);
 		const int32 ExpectedBucketRangeCount = FMath::Max(1, Width) * TileCountY * GBucketRangeUintCount;
@@ -1019,7 +1019,7 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 	TArray<FLinearColor> CurveColorsCopy;
 	{
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU.CopyCurveColors");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::UploadProcessedCurveDataToGPU.CopyCurveColors");
 		CurveColorsCopy = CurveColors;
 		if (CurveColorsCopy.Num() == 0)
 		{
@@ -1032,29 +1032,29 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	{
 		// LineDrawDesc/BucketRanges/CurveColors 都已经复制成局部变量并 move 捕获。
 		// LineDataUploadBuffer 则是三缓冲槽的 SharedPtr，避免在 game thread 再深拷贝大数组。
-		ENQUEUE_RENDER_COMMAND(ExecuteIComputerShader)(
+		ENQUEUE_RENDER_COMMAND(ExecuteExtremeValueSampleShader)(
 			[RenderTargetResource, Width, Height, LineDrawDescCopy = MoveTemp(LineDrawDescCopy),
 				LineDataUploadBuffer = MoveTemp(LineDataUploadBuffer),
 				BucketRangesCopy = MoveTemp(BucketRangesCopy),
 				CurveColorsCopy = MoveTemp(CurveColorsCopy)](
 			FRHICommandListImmediate& RHICmdList)
 			{
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread");
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("AExtremeValueSampleActor::UploadProcessedCurveDataToGPU_RenderThread");
 
 				FRDGBuilder GraphBuilder(RHICmdList);
 
-				TShaderMapRef<FIComputerShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				TShaderMapRef<FExtremeValueSampleShader> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 
-				FIComputerShader::FParameters* PassParameters = nullptr;
+				FExtremeValueSampleShader::FParameters* PassParameters = nullptr;
 				{
-					PassParameters = GraphBuilder.AllocParameters<FIComputerShader::FParameters>();
+					PassParameters = GraphBuilder.AllocParameters<FExtremeValueSampleShader::FParameters>();
 				}
 
 				{
 					FRDGTextureRef TargetTexture = RegisterExternalTexture(
 						GraphBuilder,
 						RenderTargetResource->GetRenderTargetTexture(),
-						TEXT("IComputerShader_RenderTarget")
+						TEXT("ExtremeValueSampleShader_RenderTarget")
 					);
 
 					PassParameters->RenderTarget = GraphBuilder.CreateUAV(TargetTexture);
@@ -1070,7 +1070,7 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 				{
 					TRACE_CPUPROFILER_EVENT_SCOPE_STR(
-						"AIComputerShaderObj::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
+						"AExtremeValueSampleActor::UploadProcessedCurveDataToGPU_RenderThread.UploadLineData");
 					// render thread 在这里读取被捕获的三缓冲槽，并把线段数据上传成 RDG StructuredBuffer。
 					// 直到对应 fence 完成前，game thread 都不能覆盖这个槽。
 					const TArray<FCurveSegmentGPU>& LineDataUpload = *LineDataUploadBuffer;
@@ -1106,18 +1106,18 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 					GroupCount = FComputeShaderUtils::GetGroupCount(
 						FIntVector(Width, Height, 1),
 						FIntVector(
-							FIComputerShader::ThreadGroupSizeX,
-							FIComputerShader::ThreadGroupSizeY,
-							FIComputerShader::ThreadGroupSizeZ
+							FExtremeValueSampleShader::ThreadGroupSizeX,
+							FExtremeValueSampleShader::ThreadGroupSizeY,
+							FExtremeValueSampleShader::ThreadGroupSizeZ
 						)
 					);
 				}
 
 				{
-					RDG_EVENT_SCOPE(GraphBuilder, "IComputerShader Dispatch");
-					RDG_GPU_STAT_SCOPE(GraphBuilder, IComputerShaderDispatch);
+					RDG_EVENT_SCOPE(GraphBuilder, "ExtremeValueSampleShader Dispatch");
+					RDG_GPU_STAT_SCOPE(GraphBuilder, ExtremeValueSampleShaderDispatch);
 					GraphBuilder.AddPass(
-						RDG_EVENT_NAME("IComputerShader Dispatch"),
+						RDG_EVENT_NAME("ExtremeValueSampleShader Dispatch"),
 						PassParameters,
 						ERDGPassFlags::AsyncCompute,
 						[ComputeShader, PassParameters, GroupCount](FRHIComputeCommandList& RHICmdList)
@@ -1143,7 +1143,7 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 	}
 }
 
-void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
+void AExtremeValueSampleActor::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
 {
 	// 记录最近一次模拟参数，Tick 推进相位时会沿用它们继续生成后续帧。
 	bUseSimulatedCurveData = true;
@@ -1155,7 +1155,7 @@ void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, f
 	QueueSimulatedCurveDataForWorker();
 }
 
-bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
+bool AExtremeValueSampleActor::ProcessCurveData(const TArray<TArray<float>>& Values)
 {
 	bUseSimulatedCurveData = false;
 	CachedExternalCurveSamples = Values;

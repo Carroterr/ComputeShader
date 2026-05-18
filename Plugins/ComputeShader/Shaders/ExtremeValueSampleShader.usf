@@ -58,7 +58,7 @@ float4 LoadCurveColor(uint CurveIndex, uint CurveCount)
 }
 
 [numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
-void IComputerShader(uint3 DispatchThreadId : SV_DispatchThreadID)
+void ExtremeValueSampleShader(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	float Width = LineDrawDesc[0];
 	float Height = LineDrawDesc[1];
