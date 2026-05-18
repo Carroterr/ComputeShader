@@ -4,7 +4,6 @@
 #include "GameFramework/Actor.h"
 #include "IComputerShader.h"
 #include "RenderCommandFence.h"
-#include "HAL/CriticalSection.h"
 #include "IComputerShaderObj.generated.h"
 
 class UTextureRenderTarget2D;
@@ -88,7 +87,7 @@ public:
 	// 将 ProcessCurveData 生成的最终结果上传到 GPU，并执行 compute shader。
 	void UploadProcessedCurveDataToGPU();
 
-	// 临时正弦波数据源模拟入口：只更新模拟参数；真正的正弦采样与 CPU 预处理在后台 worker 中完成。
+	// 临时正弦波数据源模拟入口：生成一份二维 raw samples 后提交给 CPU 预处理管线。
 	void SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep);
 
 private:
@@ -97,6 +96,11 @@ private:
 	void ResetCurveDataToSafeBuffers(int32 Width, int32 Height, int32 CurveCount);
 	bool ApplyProcessedCurveData(FIComputerProcessedCurveData&& ProcessedData);
 	bool TryApplyWorkerCurveProcessResult(int32 Width, int32 Height);
+	bool ProcessCurveDataOnGameThread(const TArray<TArray<float>>& Values,
+	                                  const FIComputerCurveRenderConfig& ConfigSnapshot);
+	void QueueCurveDataForWorker(TArray<TArray<float>>&& Values,
+	                             const FIComputerCurveRenderConfig& ConfigSnapshot);
+	void QueueSimulatedCurveDataForWorker();
 	void ShutdownCurveProcessWorker();
 
 	UPROPERTY(Transient)
@@ -127,13 +131,15 @@ private:
 	enum { LineDataUploadBufferCount = 3 };
 
 	TArray<float> LineDrawDesc;
-	// 保护 RenderConfig 与模拟参数的并发访问（game thread 写，worker thread 读）。
-	mutable FCriticalSection SimulationStateCriticalSection;
 	float SimulatedRunningPhase = 0.0f;
+	bool bUseSimulatedCurveData = true;
+	TArray<TArray<float>> CachedExternalCurveSamples;
 	FComputerCurveProcessWorker* CurveProcessWorker = nullptr;
 	int32 WorkerWidth = 0;
 	int32 WorkerHeight = 0;
 	float UploadTickAccumulatorSeconds = 0.0f;
+	uint64 NextCurveProcessRequestId = 0;
+	uint64 LastAcceptedCurveProcessRequestId = 0;
 
 	// LineData 三缓冲只保护“线段大数组”的生命周期：
 	// 1. game thread 把 worker 结果写入 LineDataBuffers[LineDataWriteBufferIndex]。

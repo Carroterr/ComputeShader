@@ -13,8 +13,6 @@
 #include "RenderGraphEvent.h"
 #include "RenderGraphUtils.h"
 
-#include <atomic>
-
 class FIComputerShader;
 
 DECLARE_GPU_STAT_NAMED(IComputerShaderDispatch, TEXT("IComputerShader Dispatch"));
@@ -49,6 +47,13 @@ namespace
 		FCurveSegment Segment;
 		int32 StartBucket = 0;
 		int32 EndBucket = 0;
+	};
+
+	struct FComputerCurveProcessInput
+	{
+		uint64 RequestId = 0;
+		FIComputerCurveRenderConfig RenderConfig;
+		TArray<TArray<float>> Values;
 	};
 
 	struct FSineSampleGenerator
@@ -473,61 +478,30 @@ namespace
 		return ProcessedData;
 	}
 
-	FIComputerProcessedCurveData BuildSimulatedCurveData(const FIComputerCurveRenderConfig& RenderConfig,
-	                                                     int32 Width, int32 Height, float Offset,
-	                                                     float Coefficient, float CurvePhaseStep)
+	TArray<TArray<float>> BuildSimulatedCurveSamples(const FIComputerCurveRenderConfig& RenderConfig,
+	                                                 float Offset, float Coefficient, float CurvePhaseStep)
 	{
-		FIComputerProcessedCurveData ProcessedData;
-		ProcessedData.Width = Width;
-		ProcessedData.Height = Height;
-
-		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData");
+		TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::BuildSimulatedCurveSamples");
 
 		const int32 SafeCurveCount = FMath::Max(1, RenderConfig.CurveCount);
 		const int32 SafeSampleCount = FMath::Max(2, RenderConfig.SampleCount);
 
-		FIComputerCurveRenderConfig ConfigForFrame = RenderConfig;
-		ConfigForFrame.CurveCount = SafeCurveCount;
-		ConfigForFrame.SampleCount = SafeSampleCount;
+		TArray<TArray<float>> Values;
+		Values.SetNum(SafeCurveCount);
 
-		UpdateLineDrawDesc(ProcessedData.LineDrawDesc, Width, Height, SafeCurveCount);
-		BuildCurveColors(ConfigForFrame, ProcessedData.CurveColors);
-
-		TArray<FBinnedCurveSegment> BinnedSegments;
-		TArray<int32> BucketCounts;
+		for (int32 CurveIndex = 0; CurveIndex < SafeCurveCount; ++CurveIndex)
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.InitBuckets");
-			const int64 EstimatedSegmentCount = static_cast<int64>(SafeCurveCount) * static_cast<int64>(Width) * 4;
-			BinnedSegments.Reserve(static_cast<int32>(FMath::Min<int64>(EstimatedSegmentCount, MAX_int32)));
-			BucketCounts.SetNumZeroed(FMath::Max(1, Width));
-		}
-
-		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.BuildBuckets");
-			for (int32 CurveIndex = 0; CurveIndex < SafeCurveCount; ++CurveIndex)
+			const float CurveOffset = Offset + static_cast<float>(CurveIndex) * CurvePhaseStep;
+			FSineSampleGenerator SineGenerator(CurveOffset, Coefficient);
+			TArray<float>& CurveSamples = Values[CurveIndex];
+			CurveSamples.SetNumUninitialized(SafeSampleCount);
+			for (int32 SourceIndex = 0; SourceIndex < SafeSampleCount; ++SourceIndex)
 			{
-				const float BaseLine = ConfigForFrame.BaseLineStart +
-					static_cast<float>(CurveIndex) * ConfigForFrame.BaseLineStep;
-				const float CurveOffset = Offset + static_cast<float>(CurveIndex) * CurvePhaseStep;
-				FSineSampleGenerator SineGenerator(CurveOffset, Coefficient);
-				auto GetCurveSample = [&SineGenerator](int32 SourceIndex)
-				{
-					return SineGenerator.GetSample(SourceIndex);
-				};
-
-				AddCurveToBins(CurveIndex, SafeSampleCount, Width, BaseLine, ConfigForFrame.ValueScale,
-				               GetCurveSample, BinnedSegments, BucketCounts);
+				CurveSamples[SourceIndex] = SineGenerator.GetSample(SourceIndex);
 			}
 		}
 
-		{
-			TRACE_CPUPROFILER_EVENT_SCOPE_STR("AIComputerShaderObj::ProcessSimulatedCurveData.BuildGPUData");
-			BuildBucketRangesAndLineData(BinnedSegments, BucketCounts, Height, ProcessedData.BucketRanges,
-			                             ProcessedData.LineData);
-		}
-
-		ProcessedData.bAcceptedInput = true;
-		return ProcessedData;
+		return Values;
 	}
 
 	// Legacy SetSinWaveData defaults: one 5000-sample curve, caller-provided baseline, default color.
@@ -547,21 +521,11 @@ namespace
 class FComputerCurveProcessWorker final : public FRunnable
 {
 public:
-	FComputerCurveProcessWorker(const FIComputerCurveRenderConfig* InConfigPtr,
-	                            const float* InOffsetPtr,
-	                            const float* InCoefficientPtr,
-	                            const float* InCurvePhaseStepPtr,
-	                            FCriticalSection* InSourceCriticalSection,
-	                            int32 InWidth, int32 InHeight)
-		: ConfigPtr(InConfigPtr)
-		  , OffsetPtr(InOffsetPtr)
-		  , CoefficientPtr(InCoefficientPtr)
-		  , CurvePhaseStepPtr(InCurvePhaseStepPtr)
-		  , Width(InWidth)
+	FComputerCurveProcessWorker(int32 InWidth, int32 InHeight)
+		: Width(InWidth)
 		  , Height(InHeight)
-		  , SourceCriticalSection(InSourceCriticalSection)
 	{
-		// 后台线程只负责 CPU 侧预处理：把原始采样转换成 shader 可直接消费的线段/bucket buffer。
+		// 后台线程只负责 CPU 侧预处理：把外部准备好的 raw samples 转换成 shader 可直接消费的线段/bucket buffer。
 		WorkEvent = FPlatformProcess::GetSynchEventFromPool(false);
 		Thread = FRunnableThread::Create(this, TEXT("IComputerShader_CurveProcessWorker"), 0, TPri_BelowNormal);
 	}
@@ -573,8 +537,6 @@ public:
 
 	virtual uint32 Run() override
 	{
-		uint64 LastProcessedRequestCount = 0;
-
 		while (!bStopRequested)
 		{
 			WorkEvent->Wait();
@@ -583,46 +545,35 @@ public:
 				break;
 			}
 
-			const uint64 CurrentRequestCount = WorkRequestCounter.load(std::memory_order_relaxed);
-			if (CurrentRequestCount == LastProcessedRequestCount)
-			{
-				continue;
-			}
-			LastProcessedRequestCount = CurrentRequestCount;
-
-			FIComputerCurveRenderConfig ConfigSnapshot;
-			float OffsetSnapshot = 0.0f;
-			float CoefficientSnapshot = 1.0f;
-			float CurvePhaseStepSnapshot = 0.0f;
+			FComputerCurveProcessInput Input;
 			bool bHasInput = false;
 
-			if (ConfigPtr && OffsetPtr && CoefficientPtr && CurvePhaseStepPtr && SourceCriticalSection)
 			{
-				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::SnapshotSimulationParams");
-				// 只复制轻量参数；正弦采样、M4 降采样和分桶都在锁外完成。
-				FScopeLock Lock(SourceCriticalSection);
-				ConfigSnapshot = *ConfigPtr;
-				OffsetSnapshot = *OffsetPtr;
-				CoefficientSnapshot = *CoefficientPtr;
-				CurvePhaseStepSnapshot = *CurvePhaseStepPtr;
-				bHasInput = true;
+				TRACE_CPUPROFILER_EVENT_SCOPE_STR("CurveProcessWorker::DequeueRawSamples");
+				FScopeLock Lock(&InputCriticalSection);
+				if (bHasPendingInput)
+				{
+					Input = MoveTemp(PendingInput);
+					bHasPendingInput = false;
+					bHasInput = true;
+				}
 			}
+
 			if (bHasInput)
 			{
-				// BuildSimulatedCurveData 是纯 CPU 工作：生成正弦样本、降采样、生成线段、按屏幕 x 分桶，不接触 UObject/RHI。
-				FIComputerProcessedCurveData Result = BuildSimulatedCurveData(
-					ConfigSnapshot,
+				// BuildProcessedCurveData 是纯 CPU 工作：M4 极值采样、生成线段、按屏幕 x/y tile 分桶，不接触 UObject/RHI。
+				FIComputerProcessedCurveData Result = BuildProcessedCurveData(
+					Input.Values,
+					Input.RenderConfig,
 					Width,
-					Height,
-					OffsetSnapshot,
-					CoefficientSnapshot,
-					CurvePhaseStepSnapshot
+					Height
 				);
 
 				{
 					// 只保留最新一帧结果；如果 game thread 来不及上传，旧结果会被新结果覆盖。
 					FScopeLock Lock(&ResultCriticalSection);
 					CompletedResult = MoveTemp(Result);
+					CompletedResultRequestId = Input.RequestId;
 					bHasCompletedResult = true;
 				}
 			}
@@ -640,16 +591,21 @@ public:
 		}
 	}
 
-	void RequestWork()
+	void RequestWork(FComputerCurveProcessInput&& Input)
 	{
-		WorkRequestCounter.fetch_add(1, std::memory_order_relaxed);
+		{
+			FScopeLock Lock(&InputCriticalSection);
+			PendingInput = MoveTemp(Input);
+			bHasPendingInput = true;
+		}
+
 		if (WorkEvent)
 		{
 			WorkEvent->Trigger();
 		}
 	}
 
-	bool DequeueResult(FIComputerProcessedCurveData& OutResult)
+	bool DequeueResult(FIComputerProcessedCurveData& OutResult, uint64& OutRequestId)
 	{
 		FScopeLock Lock(&ResultCriticalSection);
 		if (!bHasCompletedResult)
@@ -659,7 +615,9 @@ public:
 
 		// game thread 在 UploadProcessedCurveDataToGPU 开头取走结果，然后再进入渲染线程上传。
 		OutResult = MoveTemp(CompletedResult);
+		OutRequestId = CompletedResultRequestId;
 		bHasCompletedResult = false;
+		CompletedResultRequestId = 0;
 		return true;
 	}
 
@@ -682,21 +640,20 @@ public:
 	}
 
 private:
-	const FIComputerCurveRenderConfig* ConfigPtr = nullptr;
-	const float* OffsetPtr = nullptr;
-	const float* CoefficientPtr = nullptr;
-	const float* CurvePhaseStepPtr = nullptr;
 	int32 Width = 0;
 	int32 Height = 0;
 
 	FRunnableThread* Thread = nullptr;
 	FEvent* WorkEvent = nullptr;
 	FThreadSafeBool bStopRequested = false;
-	std::atomic<uint64> WorkRequestCounter{0};
+
+	FCriticalSection InputCriticalSection;
+	FComputerCurveProcessInput PendingInput;
+	bool bHasPendingInput = false;
 
 	FCriticalSection ResultCriticalSection;
 	FIComputerProcessedCurveData CompletedResult;
-	FCriticalSection* SourceCriticalSection = nullptr;
+	uint64 CompletedResultRequestId = 0;
 	bool bHasCompletedResult = false;
 };
 
@@ -805,7 +762,13 @@ bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 He
 	}
 
 	FIComputerProcessedCurveData ProcessedData;
-	if (!CurveProcessWorker->DequeueResult(ProcessedData))
+	uint64 ResultRequestId = 0;
+	if (!CurveProcessWorker->DequeueResult(ProcessedData, ResultRequestId))
+	{
+		return false;
+	}
+
+	if (ResultRequestId <= LastAcceptedCurveProcessRequestId)
 	{
 		return false;
 	}
@@ -815,7 +778,66 @@ bool AIComputerShaderObj::TryApplyWorkerCurveProcessResult(int32 Width, int32 He
 		return false;
 	}
 
-	return ApplyProcessedCurveData(MoveTemp(ProcessedData));
+	const bool bApplied = ApplyProcessedCurveData(MoveTemp(ProcessedData));
+	if (bApplied)
+	{
+		LastAcceptedCurveProcessRequestId = ResultRequestId;
+	}
+	return bApplied;
+}
+
+bool AIComputerShaderObj::ProcessCurveDataOnGameThread(const TArray<TArray<float>>& Values,
+                                                       const FIComputerCurveRenderConfig& ConfigSnapshot)
+{
+	const int32 Width = RenderTarget ? RenderTarget->SizeX : RenderTargetWidth;
+	const int32 Height = RenderTarget ? RenderTarget->SizeY : RenderTargetHeight;
+	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
+		Values,
+		ConfigSnapshot,
+		Width,
+		Height
+	);
+
+	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
+	return bAcceptedInput && ApplyProcessedCurveData(MoveTemp(ProcessedData));
+}
+
+void AIComputerShaderObj::QueueCurveDataForWorker(TArray<TArray<float>>&& Values,
+                                                  const FIComputerCurveRenderConfig& ConfigSnapshot)
+{
+	const uint64 RequestId = ++NextCurveProcessRequestId;
+
+	if (!CurveProcessWorker)
+	{
+		const bool bApplied = ProcessCurveDataOnGameThread(Values, ConfigSnapshot);
+		if (bApplied)
+		{
+			LastAcceptedCurveProcessRequestId = RequestId;
+		}
+		return;
+	}
+
+	FComputerCurveProcessInput Input;
+	Input.RequestId = RequestId;
+	Input.RenderConfig = ConfigSnapshot;
+	Input.Values = MoveTemp(Values);
+	CurveProcessWorker->RequestWork(MoveTemp(Input));
+}
+
+void AIComputerShaderObj::QueueSimulatedCurveDataForWorker()
+{
+	FIComputerCurveRenderConfig ConfigSnapshot = RenderConfig;
+	ConfigSnapshot.CurveCount = FMath::Max(1, ConfigSnapshot.CurveCount);
+	ConfigSnapshot.SampleCount = FMath::Max(2, ConfigSnapshot.SampleCount);
+
+	TArray<TArray<float>> SimulatedSamples = BuildSimulatedCurveSamples(
+		ConfigSnapshot,
+		SimulatedRunningPhase,
+		SimulatedSinCoefficient,
+		SimulatedCurvePhaseStep
+	);
+
+	QueueCurveDataForWorker(MoveTemp(SimulatedSamples), ConfigSnapshot);
 }
 
 void AIComputerShaderObj::ShutdownCurveProcessWorker()
@@ -851,24 +873,16 @@ void AIComputerShaderObj::BeginPlay()
 	}
 
 	SimulatedRunningPhase = SimulatedSinOffset;
-	SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
 
 	WorkerWidth = RenderTarget ? RenderTarget->SizeX : RenderTargetWidth;
 	WorkerHeight = RenderTarget ? RenderTarget->SizeY : RenderTargetHeight;
 
 	if (!CurveProcessWorker)
 	{
-		CurveProcessWorker = new FComputerCurveProcessWorker(
-			&RenderConfig,
-			&SimulatedRunningPhase,
-			&SimulatedSinCoefficient,
-			&SimulatedCurvePhaseStep,
-			&SimulationStateCriticalSection,
-			WorkerWidth,
-			WorkerHeight
-		);
+		CurveProcessWorker = new FComputerCurveProcessWorker(WorkerWidth, WorkerHeight);
 	}
-	CurveProcessWorker->RequestWork();
+
+	SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
 }
 
 void AIComputerShaderObj::Tick(float DeltaSeconds)
@@ -879,9 +893,12 @@ void AIComputerShaderObj::Tick(float DeltaSeconds)
 
 	if (UploadTickAccumulatorSeconds >= 0.033f)
 	{
-		//30hz运行速度
-		SimulatedRunningPhase = FMath::Fmod(SimulatedRunningPhase + DeltaSeconds * SimulatedScrollSpeed, 2.0f * PI);
-		SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
+		if (bUseSimulatedCurveData)
+		{
+			//30hz运行速度
+			SimulatedRunningPhase = FMath::Fmod(SimulatedRunningPhase + DeltaSeconds * SimulatedScrollSpeed, 2.0f * PI);
+			SetMultiSinWaveData(SimulatedRunningPhase, SimulatedSinCoefficient, SimulatedCurvePhaseStep);
+		}
 		UploadTickAccumulatorSeconds -= 0.033f;
 		UploadProcessedCurveDataToGPU();
 	}
@@ -911,14 +928,17 @@ void AIComputerShaderObj::Execute()
 
 void AIComputerShaderObj::SetRenderConfig(const FIComputerCurveRenderConfig& InConfig)
 {
-	{
-		FScopeLock Lock(&SimulationStateCriticalSection);
-		RenderConfig = InConfig;
-	}
+	RenderConfig = InConfig;
 
-	if (CurveProcessWorker)
+	if (bUseSimulatedCurveData)
 	{
-		CurveProcessWorker->RequestWork();
+		QueueSimulatedCurveDataForWorker();
+	}
+	else if (CachedExternalCurveSamples.Num() > 0)
+	{
+		const uint64 RequestId = ++NextCurveProcessRequestId;
+		ProcessCurveDataOnGameThread(CachedExternalCurveSamples, RenderConfig);
+		LastAcceptedCurveProcessRequestId = RequestId;
 	}
 }
 
@@ -1125,31 +1145,24 @@ void AIComputerShaderObj::UploadProcessedCurveDataToGPU()
 
 void AIComputerShaderObj::SetMultiSinWaveData(float offset, float coefficient, float curvePhaseStep)
 {
-	{
-		FScopeLock Lock(&SimulationStateCriticalSection);
+	// 记录最近一次模拟参数，Tick 推进相位时会沿用它们继续生成后续帧。
+	bUseSimulatedCurveData = true;
+	CachedExternalCurveSamples.Reset();
+	SimulatedRunningPhase = offset;
+	SimulatedSinCoefficient = coefficient;
+	SimulatedCurvePhaseStep = curvePhaseStep;
 
-		// 记录最近一次模拟参数，Tick 推进相位时会沿用它们继续生成后续帧。
-		SimulatedRunningPhase = offset;
-		SimulatedSinCoefficient = coefficient;
-		SimulatedCurvePhaseStep = curvePhaseStep;
-	}
-
-	if (CurveProcessWorker)
-	{
-		CurveProcessWorker->RequestWork();
-	}
+	QueueSimulatedCurveDataForWorker();
 }
 
 bool AIComputerShaderObj::ProcessCurveData(const TArray<TArray<float>>& Values)
 {
-	const int32 Width = RenderTarget ? RenderTarget->SizeX : 1024;
-	const int32 Height = RenderTarget ? RenderTarget->SizeY : 1024;
-	FIComputerProcessedCurveData ProcessedData = BuildProcessedCurveData(
-		Values,
-		RenderConfig,
-		Width,
-		Height
-	);
-	const bool bAcceptedInput = ProcessedData.bAcceptedInput;
-	return bAcceptedInput && ApplyProcessedCurveData(MoveTemp(ProcessedData));
+	bUseSimulatedCurveData = false;
+	CachedExternalCurveSamples = Values;
+
+	const uint64 RequestId = ++NextCurveProcessRequestId;
+
+	const bool bApplied = ProcessCurveDataOnGameThread(Values, RenderConfig);
+	LastAcceptedCurveProcessRequestId = RequestId;
+	return bApplied;
 }
